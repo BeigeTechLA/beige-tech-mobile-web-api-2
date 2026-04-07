@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Creative Has Been Assigned</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f8f9fa;
+        }
+
+        .email-container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header {
+            background-color: #C9B896;
+            color: #ffffff;
+            padding: 40px 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            font-size: 16px;
+            opacity: 0.95;
+        }
+
+        .content {
+            padding: 40px 30px;
+        }
+
+        .greeting {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 24px;
+        }
+
+        .message {
+            font-size: 16px;
+            color: #666;
+            margin-bottom: 30px;
+            line-height: 1.8;
+        }
+
+        .creative-info-box {
+            background-color: #F3EDE0;
+            border-left: 4px solid #C9B896;
+            padding: 24px;
+            margin: 30px 0;
+            border-radius: 4px;
+        }
+
+        .creative-info-box h2 {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 16px;
+            font-weight: 600;
+        }
+
+        .creative-detail {
+            display: flex;
+            margin-bottom: 12px;
+            font-size: 15px;
+        }
+
+        .creative-detail:last-child {
+            margin-bottom: 0;
+        }
+
+        .creative-detail .label {
+            font-weight: 600;
+            color: #555;
+            min-width: 120px;
+        }
+
+        .creative-detail .value {
+            color: #333;
+        }
+
+        .next-steps {
+            background-color: #E8F5E9;
+            border-radius: 4px;
+            padding: 20px;
+            margin: 30px 0;
+        }
+
+        .next-steps h3 {
+            font-size: 16px;
+            color: #2E7D32;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+
+        .next-steps p {
+            font-size: 15px;
+            color: #1B5E20;
+            line-height: 1.6;
+        }
+
+        .footer {
+            background-color: #f8f9fa;
+            padding: 30px;
+            text-align: center;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .footer p {
+            font-size: 14px;
+            color: #6c757d;
+            margin-bottom: 8px;
+        }
+
+        .footer .signature {
+            font-size: 16px;
+            color: #333;
+            font-weight: 600;
+            margin-top: 16px;
+        }
+
+        @media only screen and (max-width: 600px) {
+            .email-container {
+                border-radius: 0;
+            }
+
+            .header, .content, .footer {
+                padding: 30px 20px;
+            }
+
+            .creative-detail {
+                flex-direction: column;
+            }
+
+            .creative-detail .label {
+                margin-bottom: 4px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="email-container">
+        <!-- Header -->
+        <div class="header">
+            <h1>Your Creative Has Been Assigned! 🎉</h1>
+            <p>We're ready to bring your vision to life</p>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+            <p class="greeting">Hi {{clientName}},</p>
+
+            <p class="message">
+                Great news! We've assigned a talented creative professional to your project.
+                Below you'll find their contact information so you can connect directly.
+            </p>
+
+            <!-- Creative Information -->
+            <div class="creative-info-box">
+                <h2>Your Creative's Contact Information</h2>
+                <div class="creative-detail">
+                    <span class="label">Name:</span>
+                    <span class="value">{{creativeName}}</span>
+                </div>
+                <div class="creative-detail">
+                    <span class="label">Phone:</span>
+                    <span class="value">{{creativePhone}}</span>
+                </div>
+                {{#if creativeEmail}}
+                <div class="creative-detail">
+                    <span class="label">Email:</span>
+                    <span class="value">{{creativeEmail}}</span>
+                </div>
+                {{/if}}
+                {{#if creativeSocial}}
+                <div class="creative-detail">
+                    <span class="label">Social Media:</span>
+                    <span class="value">{{creativeSocial}}</span>
+                </div>
+                {{/if}}
+            </div>
+
+            <!-- Next Steps -->
+            <div class="next-steps">
+                <h3>What Happens Next?</h3>
+                <p>
+                    The Beige operations team will be reaching out to you via text shortly
+                    to coordinate the details of your shoot and answer any questions you may have.
+                </p>
+            </div>
+
+            <p class="message">
+                We're excited to work with you and can't wait to see the amazing content we'll create together!
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>If you have any questions, please don't hesitate to reach out.</p>
+            <p>📧 info@beigecorporation.io</p>
+            <p class="signature">Best regards,<br>The Beige Team</p>
+        </div>
+    </div>
+</body>
+</html>

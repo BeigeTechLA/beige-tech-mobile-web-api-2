@@ -1,0 +1,1 @@
+.results[] | select(.photographyRate) | {id: ._id, geo_location, city, photographyRate}

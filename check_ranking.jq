@@ -1,0 +1,1 @@
+.data[0] | {rankingScore, distance, breakdown: .rankingBreakdown, city, photographyRate}

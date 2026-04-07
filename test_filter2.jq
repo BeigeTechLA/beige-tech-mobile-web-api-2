@@ -1,0 +1,1 @@
+.results[] | select(.photographyRate != null and .photographyRate != "0") | {_id, photographyRate, videographyRate, combinedRate, content_type, average_rating, trust_score, tier, rates}

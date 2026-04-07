@@ -1,0 +1,266 @@
+### Notification API Testing Collection
+### Base URL: http://localhost:5002/v1/notifications
+### NOTE: Replace {{authToken}} with your actual JWT token
+### You can get the token by logging in first
+
+@baseUrl = http://localhost:5002
+@authToken = YOUR_JWT_TOKEN_HERE
+
+### ============================================
+### SETUP: Login to get auth token
+### ============================================
+
+# @name login
+POST {{baseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "password123"
+}
+
+### ============================================
+### 1. CREATE NOTIFICATION (New Schema)
+### ============================================
+
+# @name createNotification
+POST {{baseUrl}}/v1/notifications
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "modelName": "Order",
+  "modelId": "507f1f77bcf86cd799439011",
+  "clientId": "507f1f77bcf86cd799439012",
+  "cpIds": ["507f1f77bcf86cd799439013"],
+  "message": "Your order #12345 has been confirmed",
+  "category": "Order",
+  "metadata": {
+    "orderNumber": "12345",
+    "status": "confirmed"
+  }
+}
+
+### ============================================
+### 2. CREATE NOTIFICATION (Legacy Format)
+### ============================================
+
+# @name createNotificationLegacy
+POST {{baseUrl}}/v1/notifications/legacy
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "modelName": "Booking",
+  "modelId": "507f1f77bcf86cd799439014",
+  "message": "Your booking has been updated",
+  "category": "Booking"
+}
+
+### ============================================
+### 3. GET ALL NOTIFICATIONS (with pagination)
+### ============================================
+
+# @name getAllNotifications
+GET {{baseUrl}}/v1/notifications?page=1&limit=10&sortBy=createdAt:desc
+Authorization: Bearer {{authToken}}
+
+### Get notifications filtered by category
+GET {{baseUrl}}/v1/notifications?category=Order&page=1&limit=10
+Authorization: Bearer {{authToken}}
+
+### Get notifications filtered by model
+GET {{baseUrl}}/v1/notifications?modelName=Order&modelId=507f1f77bcf86cd799439011
+Authorization: Bearer {{authToken}}
+
+### Get unread notifications only
+GET {{baseUrl}}/v1/notifications?isRead=false&page=1&limit=10
+Authorization: Bearer {{authToken}}
+
+### Get read notifications only
+GET {{baseUrl}}/v1/notifications?isRead=true&page=1&limit=10
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 4. GET MY NOTIFICATIONS (Current User)
+### ============================================
+
+# @name getMyNotifications
+GET {{baseUrl}}/v1/notifications/my
+Authorization: Bearer {{authToken}}
+
+### Get my notifications with pagination
+GET {{baseUrl}}/v1/notifications/my?page=1&limit=10&sortBy=createdAt:desc
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 5. GET NOTIFICATIONS BY CATEGORY
+### ============================================
+
+# @name getNotificationsByCategory
+GET {{baseUrl}}/v1/notifications/category/Order
+Authorization: Bearer {{authToken}}
+
+### Get by Booking category
+GET {{baseUrl}}/v1/notifications/category/Booking
+Authorization: Bearer {{authToken}}
+
+### Get by Payment category
+GET {{baseUrl}}/v1/notifications/category/Payment
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 6. GET NOTIFICATIONS BY MODEL
+### ============================================
+
+# @name getNotificationsByModel
+GET {{baseUrl}}/v1/notifications/model/Order/507f1f77bcf86cd799439011
+Authorization: Bearer {{authToken}}
+
+### Get by Booking model
+GET {{baseUrl}}/v1/notifications/model/Booking/507f1f77bcf86cd799439014
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 7. GET UNREAD COUNT
+### ============================================
+
+# @name getUnreadCount
+GET {{baseUrl}}/v1/notifications/unread-count
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 8. GET SPECIFIC NOTIFICATION BY ID
+### ============================================
+
+# @name getNotificationById
+GET {{baseUrl}}/v1/notifications/507f1f77bcf86cd799439015
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 9. MARK NOTIFICATION AS READ
+### ============================================
+
+# @name markAsRead
+PATCH {{baseUrl}}/v1/notifications/507f1f77bcf86cd799439015/read
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 10. MARK ALL NOTIFICATIONS AS READ
+### ============================================
+
+# @name markAllAsRead
+PATCH {{baseUrl}}/v1/notifications/mark-all-read
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "userId": "507f1f77bcf86cd799439012",
+  "userRole": "client"
+}
+
+### ============================================
+### 11. UPDATE NOTIFICATION
+### ============================================
+
+# @name updateNotification
+PATCH {{baseUrl}}/v1/notifications/507f1f77bcf86cd799439015
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "message": "Updated message: Your order has been shipped",
+  "metadata": {
+    "orderNumber": "12345",
+    "status": "shipped",
+    "trackingNumber": "TRACK123456"
+  }
+}
+
+### ============================================
+### 12. DELETE SPECIFIC NOTIFICATION
+### ============================================
+
+# @name deleteNotification
+DELETE {{baseUrl}}/v1/notifications/507f1f77bcf86cd799439015
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### 13. DELETE NOTIFICATIONS BY MODEL
+### ============================================
+
+# @name deleteNotificationsByModel
+DELETE {{baseUrl}}/v1/notifications/model/Order/507f1f77bcf86cd799439011
+Authorization: Bearer {{authToken}}
+
+### ============================================
+### TESTING SCENARIOS
+### ============================================
+
+### Scenario 1: Create multiple notifications for testing
+POST {{baseUrl}}/v1/notifications
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "modelName": "Order",
+  "modelId": "507f1f77bcf86cd799439020",
+  "message": "Test notification 1 - Order placed",
+  "category": "Order"
+}
+
+###
+POST {{baseUrl}}/v1/notifications
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "modelName": "Order",
+  "modelId": "507f1f77bcf86cd799439020",
+  "message": "Test notification 2 - Payment received",
+  "category": "Order"
+}
+
+###
+POST {{baseUrl}}/v1/notifications
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "modelName": "Booking",
+  "modelId": "507f1f77bcf86cd799439021",
+  "message": "Test notification 3 - Booking confirmed",
+  "category": "Booking"
+}
+
+### Scenario 2: Error testing - Invalid notification ID
+GET {{baseUrl}}/v1/notifications/invalid-id-format
+Authorization: Bearer {{authToken}}
+
+### Scenario 3: Error testing - Missing required fields
+POST {{baseUrl}}/v1/notifications
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "message": "This should fail - missing required fields"
+}
+
+### Scenario 4: Error testing - Unauthorized access (no token)
+GET {{baseUrl}}/v1/notifications/my
+
+### ============================================
+### ROLE-BASED TESTING
+### ============================================
+
+### Test as Admin (should see all notifications)
+GET {{baseUrl}}/v1/notifications?page=1&limit=10
+Authorization: Bearer {{adminAuthToken}}
+
+### Test as Client (should see only their notifications)
+GET {{baseUrl}}/v1/notifications?page=1&limit=10
+Authorization: Bearer {{clientAuthToken}}
+
+### Test as Content Provider (should see only their notifications)
+GET {{baseUrl}}/v1/notifications?page=1&limit=10
+Authorization: Bearer {{cpAuthToken}}

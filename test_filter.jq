@@ -1,0 +1,1 @@
+[.results[] | select(.photographyRate != null and .photographyRate != "0")] | length

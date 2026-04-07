@@ -1,0 +1,37 @@
+### Test Transaction API
+### User ID: 6950a61471abe622bbc5967a3
+### JWT Token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2OTUwYTYxNDcxYWJlNjJiYmM1OTY3YTMiLCJpYXQiOjE3NjY5MTI5NzgsImV4cCI6MTc2NjkxNDc3OCwidHlwZSI6ImFjY2VzcyJ9.SdBZ0snyQydmsLq7UWgBk_3wyCvT72Eci6affq3zSJk
+
+@baseUrl = http://localhost:5002
+@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2OTUwYTYxNDcxYWJlNjJiYmM1OTY3YTMiLCJpYXQiOjE3NjY5MTI5NzgsImV4cCI6MTc2NjkxNDc3OCwidHlwZSI6ImFjY2VzcyJ9.SdBZ0snyQydmsLq7UWgBk_3wyCvT72Eci6affq3zSJk
+
+### 1. Get My Transactions
+GET {{baseUrl}}/api/v1/transactions/my-transactions
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### 2. Get My Transactions with Pagination
+GET {{baseUrl}}/api/v1/transactions/my-transactions?page=1&limit=10
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### 3. Get Transaction Summary (Total, Last Month, Balance)
+GET {{baseUrl}}/api/v1/transactions/summary
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### 4. Get Transactions Filtered by Type (Earnings only)
+GET {{baseUrl}}/api/v1/transactions/my-transactions?type=earning
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### 5. Get Transactions Filtered by Status (Completed only)
+GET {{baseUrl}}/api/v1/transactions/my-transactions?status=completed
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### 6. Get Transactions with Date Range
+GET {{baseUrl}}/api/v1/transactions/my-transactions?dateFrom=2025-01-01&dateTo=2025-01-31
+Authorization: Bearer {{token}}
+Content-Type: application/json
+

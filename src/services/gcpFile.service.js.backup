@@ -1,0 +1,1577 @@
+const { Storage } = require("@google-cloud/storage");
+const config = require("../config/config");
+const ApiError = require("../utils/ApiError");
+const httpStatus = require("http-status");
+const archiver = require("archiver");
+const orderService = require("../services/order.service");
+const userService = require("../services/user.service");
+const getLastFiveChars = require("../utils/getLastFiveCharc");
+const fs = require("fs");
+const logger = require("../config/logger");
+const { FileMeta } = require("../models");
+
+const DEFAULT_SETTINGS = {
+  defaultPublicFiles: false,
+  privateUrlExpiration: 7,
+  cdnAdmins: "",
+};
+
+// Check if GCP credentials file exists before initializing
+let bucket = null;
+let gcpEnabled = false;
+
+try {
+  if (config.GCP.keyFilename && fs.existsSync(config.GCP.keyFilename)) {
+    bucket = new Storage({
+      keyFilename: config.GCP.keyFilename,
+    }).bucket(config.GCP.bucketName);
+    gcpEnabled = true;
+    logger.info("GCP Storage initialized successfully");
+  } else {
+    logger.warn("GCP credentials file not found - GCP features will be disabled");
+  }
+} catch (error) {
+  logger.warn(`GCP Storage initialization failed: ${error.message} - GCP features will be disabled`);
+}
+
+const CDN_URL = process.env.CDN_URL || null;
+const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || "*";
+
+// let CDN_ADMINS = [process.env.CDN_ADMIN];
+let CDN_ADMINS = [config.GCP.cdnAdmins];
+let PRIVATE_URL_EXPIRY_DAYS = DEFAULT_SETTINGS.privateUrlExpiration;
+
+async function getUserSettings() {
+  if (!gcpEnabled || !bucket) return DEFAULT_SETTINGS;
+  if (!(await bucket.file(config.GCP.keyFilename).exists())[0])
+    return DEFAULT_SETTINGS; // Settings don't exist, return defaults
+  return JSON.parse(
+    (await bucket.file(config.GCP.keyFilename).download())[0].toString("utf8")
+  );
+}
+
+async function updateWithUserSettings() {
+  if (!gcpEnabled) return;
+  const userSettings = await getUserSettings();
+  if (!userSettings.useSettings) return;
+  PRIVATE_URL_EXPIRY_DAYS = userSettings.privateUrlExpiration;
+  CDN_ADMINS = [process.env.CDN_ADMIN];
+  // CDN_ADMINS.push(...userSettings?.cdnAdmins?.split(","));
+}
+
+updateWithUserSettings();
+
+// Helper function to check if GCP is available
+const checkGcpEnabled = () => {
+  if (!gcpEnabled || !bucket) {
+    throw new ApiError(httpStatus.SERVICE_UNAVAILABLE, "GCP Storage is not configured");
+  }
+};
+
+let CorsAlreadyChecked = false;
+async function setBucketCors() {
+  if (!gcpEnabled || !bucket) return;
+  if (CorsAlreadyChecked) return;
+  const corsSetFlag = bucket.file(".bucket.cors-configured");
+  if ((await corsSetFlag.exists())[0]) {
+    CorsAlreadyChecked = true;
+    return;
+  }
+  const corsConfig = [
+    {
+      method: ["*"],
+      origin: [DASHBOARD_ORIGIN],
+      responseHeader: ["*"],
+    },
+  ];
+  await bucket.setCorsConfiguration(corsConfig);
+  await corsSetFlag.save(
+    `This bucket's CORS has been set to allow request from the file manager`
+  );
+  CorsAlreadyChecked = true;
+}
+
+const createFolder = async (folderName, cpIds, orderId, client_id) => {
+  checkGcpEnabled();
+  let options = {};
+
+  // Determine the userId - prioritize client_id, then try to extract from cpIds
+  let userId = client_id;
+  if (!userId && cpIds?.length > 0) {
+    // If cpIds is provided but client_id is not, use the first CP id
+    const firstCp = cpIds.find((item) => item.id);
+    if (firstCp) {
+      userId = firstCp.id;
+    }
+  }
+
+  if (cpIds?.length > 0 || orderId) {
+    const idsArray = cpIds.filter((item) => item.id).map((item) => item.id);
+    options = {
+      metadata: {
+        metadata: {
+          createdBy: JSON.stringify([...idsArray, client_id]),
+          orderId: JSON.stringify(orderId),
+        },
+      },
+    };
+  }
+
+  // Check and create shoots folder if it doesn't exist
+  const shootsFolder = bucket.file("shoots/");
+  const [shootsExists] = await shootsFolder.exists();
+  if (!shootsExists) {
+    await shootsFolder.save("");
+  }
+
+  // Create new folder inside shoots
+  // Check if folderName already starts with 'shoots/' to prevent duplication
+  const folderPath = folderName.startsWith("shoots/")
+    ? folderName
+    : `shoots/${folderName}`;
+  // Normalize path by replacing multiple consecutive slashes with a single slash
+  const normalizedPath = folderPath.replace(/\/+/g, "/");
+
+  // Ensure folder path ends with /
+  const folderPathWithSlash = normalizedPath.endsWith("/") ? normalizedPath : normalizedPath + "/";
+
+  // Extract the folder name (without shoots/ prefix and trailing /)
+  const pathWithoutPrefix = folderPathWithSlash.replace("shoots/", "");
+  const folderDisplayName = pathWithoutPrefix.replace(/\/$/, "").split("/").filter(Boolean).pop() || pathWithoutPrefix.replace(/\/$/, "");
+
+  try {
+    const newFolder = bucket.file(folderPathWithSlash);
+    const [exists] = await newFolder.exists();
+
+    // Save the folder to GCS with or without metadata based on cpIds
+    // Only save to GCS if it doesn't exist already
+    if (!exists) {
+      await newFolder.save("", options);
+      console.log('✅ Folder saved to GCS:', folderPathWithSlash);
+    } else {
+      console.log('📁 Folder already exists in GCS:', folderPathWithSlash);
+    }
+
+    // Check if folder already exists in database regardless of userId
+    let folderDoc = null;
+    let existingFolder = await FileMeta.findOne({
+      path: pathWithoutPrefix
+    });
+
+    // If folder exists in database, update it if there are changes to metadata
+    if (existingFolder) {
+      console.log('Folder already exists in database:', pathWithoutPrefix);
+
+      // Check if we need to update the metadata (especially cpIds)
+      let needsUpdate = false;
+      if (cpIds && Array.isArray(cpIds) && cpIds.length > 0) {
+        // Check if cpIds are different
+        const existingCpIds = existingFolder.metadata?.cpIds || [];
+        const existingCpIdsSet = new Set(existingCpIds.map(cp => cp.id || cp));
+        const newCpIdsSet = new Set(cpIds.map(cp => cp.id || cp));
+
+        if (existingCpIdsSet.size !== newCpIdsSet.size ||
+            ![...existingCpIdsSet].every(id => newCpIdsSet.has(id)) ||
+            ![...newCpIdsSet].every(id => existingCpIdsSet.has(id))) {
+          needsUpdate = true;
+        }
+      }
+
+      if (orderId && existingFolder.metadata?.orderId !== orderId) {
+        needsUpdate = true;
+      }
+
+      if (needsUpdate) {
+        existingFolder.metadata = {
+          orderId: orderId || existingFolder.metadata?.orderId || null,
+          cpIds: cpIds || existingFolder.metadata?.cpIds || []
+        };
+        await existingFolder.save();
+        console.log('✅ Folder metadata updated in database:', existingFolder._id);
+      }
+
+      folderDoc = existingFolder;
+    } else {
+      // Create new folder in database if it doesn't exist
+      try {
+        folderDoc = await FileMeta.create({
+          path: pathWithoutPrefix,
+          name: folderDisplayName,
+          userId: userId || null, // Allow null userId for system-created folders
+          isFolder: true,
+          contentType: "folder",
+          size: 0,
+          isPublic: false,
+          fullPath: folderPathWithSlash,
+          metadata: {
+            orderId: orderId || null,
+            cpIds: cpIds || []
+          }
+        });
+
+        console.log('✅ Folder metadata saved to database:', folderDoc._id);
+      } catch (dbError) {
+        console.error('❌ Error saving folder to database:', dbError);
+        // Continue even if database save fails - GCS folder is created
+      }
+    }
+
+    return {
+      saved: true,
+      folder: folderDoc ? {
+        id: folderDoc._id.toString(),
+        path: folderDoc.path,
+        name: folderDoc.name,
+        isFolder: true
+      } : null
+    };
+  } catch (error) {
+    console.error("Error saving folder:", error);
+    return { error: "save-error" };
+  }
+};
+const createChatFolder = async (folderName, cpIds, orderId) => {
+  let options = {};
+
+  if (cpIds?.length > 0 || orderId) {
+    const idsArray = cpIds.filter((item) => item.id).map((item) => item.id);
+    options = {
+      metadata: {
+        metadata: {
+          createdBy: JSON.stringify([...idsArray]),
+          orderId: JSON.stringify(orderId),
+        },
+      },
+    };
+  }
+
+  // Check and create shoots folder if it doesn't exist
+  const shootsFolder = bucket.file("chats/");
+  const [shootsExists] = await shootsFolder.exists();
+  if (!shootsExists) {
+    await shootsFolder.save("");
+  }
+
+  // Create new folder inside shoots
+  const folderPath = `chats/${folderName}`.replace(/\/+/g, "/");
+  const newFolder = bucket.file(folderPath + "/");
+
+  try {
+    const [exists] = await newFolder.exists();
+
+    if (exists) {
+      return { error: "file-exists" }; // 409 conflict
+    }
+    // Save the folder with or without metadata based on cpIds
+    await newFolder.save("", options);
+    return { saved: true };
+  } catch (error) {
+    console.error("Error saving folder:", error);
+    return { error: "save-error" };
+  }
+};
+
+const getFiles = async (userId, role, path = null) => {
+  try {
+    console.log('📂 Fetching files for userId:', userId, 'role:', role, 'path:', path);
+
+    // Determine if the user has admin privileges
+    const isAdmin = role === "admin" || role === "post_production_manager";
+
+    // Build query for database
+    let query = {};
+
+    // Build path filter
+    let pathFilter = {};
+    if (path) {
+      const decodedPath = decodeURIComponent(path);
+      // Get files directly in this folder (not nested)
+      pathFilter.$or = [
+        { path: new RegExp(`^${decodedPath.replace(/\/$/, '')}/[^/]+$`) }, // Files in this folder
+        { path: new RegExp(`^${decodedPath.replace(/\/$/, '')}/[^/]+/$`) } // Subfolders in this folder
+      ];
+    } else {
+      // Root level - get files that don't have nested paths
+      pathFilter.$or = [
+        { path: /^[^/]+$/ },      // Files at root
+        { path: /^[^/]+\/$/ }     // Folders at root
+      ];
+    }
+
+    if (!isAdmin) {
+      // Non-admin users can see:
+      // 1. Files/folders where they are the owner (userId)
+      // 2. Folders where they are in the cpIds array (assigned CPs for orders)
+      // This allows both client (user) and CP to access order folders
+
+      // Convert userId to string for consistent comparison
+      // (cpIds are stored as strings in metadata)
+      const userIdStr = userId?.toString();
+
+      const userAccessFilter = {
+        $or: [
+          { userId: userId },
+          // Check cpIds with string format (how we store them now)
+          { 'metadata.cpIds.id': userIdStr },
+          // Also check with ObjectId format for backward compatibility
+          { 'metadata.cpIds.id': userId },
+          // Check if userId is directly in cpIds array
+          { 'metadata.cpIds': { $elemMatch: { id: userIdStr } } },
+          { 'metadata.cpIds': { $elemMatch: { id: userId } } }
+        ]
+      };
+
+      // Combine user access filter with path filter using $and
+      query = {
+        $and: [
+          userAccessFilter,
+          pathFilter
+        ]
+      };
+
+      console.log('🔍 Query for user:', userIdStr, 'isAdmin:', isAdmin);
+    } else {
+      // Admin can see all files, just apply path filter
+      query = pathFilter;
+    }
+
+    const files = await FileMeta.find(query)
+      .sort({ isFolder: -1, createdAt: -1 }) // Folders first, then by date
+      .lean();
+
+    console.log('✅ Found files in database:', files.length);
+
+    // Transform data to match frontend expectations
+    const transformedFiles = files.map(file => {
+      // Determine if current user is the owner
+      const isOwner = file.userId?.toString() === userId?.toString();
+
+      // Get all users who have access (owner + CPs)
+      let createdByUsers = [file.userId];
+      if (file.metadata?.cpIds && Array.isArray(file.metadata.cpIds)) {
+        const cpIdsList = file.metadata.cpIds.map(cp => cp.id || cp).filter(Boolean);
+        createdByUsers = [...new Set([...createdByUsers, ...cpIdsList])];
+      }
+
+      return {
+        id: file._id.toString(),
+        path: file.path,
+        name: file.name || file.path.split('/').filter(Boolean).pop(),
+        size: file.size || 0,
+        contentType: file.contentType || (file.isFolder ? 'folder' : 'application/octet-stream'),
+        isFolder: file.isFolder || file.path.endsWith('/'),
+        updated: file.updatedAt || file.createdAt,
+        created: file.createdAt,
+        userId: file.userId,
+        version: file.version || file._id.toString(),
+        downloadLink: file.isPublic ? `https://storage.googleapis.com/${bucket.name}/shoots/${file.path}` : null,
+        isPublic: file.isPublic || false,
+        author: file.author || 'Unknown',
+        url: `https://storage.googleapis.com/${bucket.name}/shoots/${file.path}`,
+        fullPath: file.fullPath || `shoots/${file.path}`,
+        // Legacy fields for compatibility
+        cacheControl: '',
+        contentEncoding: '',
+        formattedSize: formatFileSize(file.size || 0),
+        createdBy: createdByUsers,
+        orderId: file.metadata?.orderId || null,
+        cpIds: file.metadata?.cpIds || [],
+        isOwner: isOwner
+      };
+    });
+
+    return {
+      bucket: bucket.name,
+      files: transformedFiles,
+      totalFiles: transformedFiles.length,
+      success: true,
+      path: path || ''
+    };
+  } catch (error) {
+    console.error("❌ Error fetching files:", error);
+    return {
+      success: false,
+      error: "Failed to fetch files",
+      details: error.message,
+    };
+  }
+};
+
+// Helper function to format file size
+const formatFileSize = (sizeInBytes) => {
+  if (sizeInBytes === 0) return "0 B";
+  if (sizeInBytes < 1024) return sizeInBytes + " B";
+  if (sizeInBytes < 1024 * 1024) return (sizeInBytes / 1024).toFixed(2) + " KB";
+  return (sizeInBytes / (1024 * 1024)).toFixed(2) + " MB";
+};
+
+const getChatFiles = async (folderPath) => {
+  try {
+    const normalizedPath = folderPath.startsWith("chats/")
+      ? folderPath
+      : `chats/${folderPath}`;
+
+    const [files] = await bucket.getFiles({
+      prefix: normalizedPath,
+      autoPaginate: false,
+    });
+
+    // Filter out the folder itself and empty entries
+    const actualFiles = files.filter(
+      (file) => file.name !== normalizedPath + "/" && !file.name.endsWith("/")
+    );
+
+    if (actualFiles.length === 0) {
+      return { error: "no-files-found" };
+    }
+
+    const filesList = actualFiles.map((file) => ({
+      name: file.name,
+      url: `https://storage.googleapis.com/${bucket.name}/${encodeURIComponent(
+        file.name
+      )}`,
+      contentType: file.metadata.contentType || "",
+      size: file.metadata.size || "0",
+      created: file.metadata.timeCreated,
+      updated: file.metadata.updated,
+      downloadUrl: file.metadata.mediaLink,
+    }));
+
+    return {
+      success: true,
+      path: normalizedPath,
+      totalFiles: filesList.length,
+      files: filesList,
+    };
+  } catch (error) {
+    console.error("Error getting chat folder files:", error);
+    return { error: "fetch-error" };
+  }
+};
+
+const downloadFiles = async (filePath, download) => {
+  const expiryDate = new Date(Date.now() + 60 * 60 * 1000); // Plus one hour
+  if (!download)
+    expiryDate.setDate(expiryDate.getDate() + PRIVATE_URL_EXPIRY_DAYS);
+  const [url] = await bucket.file(filePath).getSignedUrl({
+    version: "v2",
+    action: "read",
+    expires: expiryDate,
+    cname: download ? null : CDN_URL,
+    promptSaveAs: download
+      ? filePath.split("/")[filePath.split("/").length - 1]
+      : null,
+  });
+  return { url, duration: PRIVATE_URL_EXPIRY_DAYS };
+};
+
+const uploadFile = async (
+  filePath,
+  fileContentType,
+  fileSize,
+  userId = null,
+  metadata = {}
+) => {
+  await setBucketCors(); // Make sure bucket cors policy is set to allow access from file manager
+
+  const newFile = bucket.file(filePath);
+  const expDate = Date.now() + 60 * 60 * 1000; // Allow 60 minutes for upload
+
+  // Extract folder path from file path
+  const lastSlashIndex = filePath.lastIndexOf('/');
+  const folderPath = lastSlashIndex !== -1 ? filePath.substring(0, lastSlashIndex + 1) : '';
+  
+  // Initialize array of user IDs with the provided userId (if any)
+  let userIds = userId ? [userId] : []; // Client Id added here
+  
+  // If this file is in a folder, check the folder's metadata for createdBy users
+  if (folderPath) {
+    try {
+      const folder = bucket.file(folderPath);
+      const [exists] = await folder.exists();
+      
+      if (exists) {
+        const [folderMetadata] = await folder.getMetadata();
+        
+        if (folderMetadata.metadata && folderMetadata.metadata.createdBy) {
+          try {
+            let folderCreatedBy;
+            
+            // Handle different formats of createdBy metadata
+            if (typeof folderMetadata.metadata.createdBy === 'string') {
+              try {
+                // Try to parse as JSON
+                folderCreatedBy = JSON.parse(folderMetadata.metadata.createdBy);
+              } catch (parseError) {
+                // If parsing fails, treat as a single string ID
+                folderCreatedBy = [folderMetadata.metadata.createdBy];
+              }
+            } else if (Array.isArray(folderMetadata.metadata.createdBy)) {
+              // If it's already an array, use it directly
+              folderCreatedBy = folderMetadata.metadata.createdBy;
+            }
+            
+            // If we have valid folder users, merge them with our list
+            if (Array.isArray(folderCreatedBy)) {
+              userIds = [...new Set([...userIds, ...folderCreatedBy])];
+            }
+          } catch (e) {
+            console.error('Error processing folder createdBy metadata:', e);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error getting folder metadata:', e);
+    }
+  }
+  
+  // Prepare metadata with user IDs - store as direct array, not as JSON string
+  // This ensures consistent format between storage and retrieval
+  let fileMetadata = {};
+  if (userIds.length > 0) {
+    fileMetadata = {
+      metadata: {
+        createdBy: userIds, // Store as direct array, not JSON string
+        ...metadata,
+      },
+    };
+  }
+
+  const options = {
+    expires: expDate,
+    conditions: [
+      ["eq", "$Content-Type", fileContentType],
+      ["content-length-range", 0, fileSize + 1024],
+    ],
+    fields: {
+      success_action_status: "201",
+      "Content-Type": fileContentType,
+    }
+  };
+  
+  // Generate the signed URL for upload
+  const [response] = await newFile.generateSignedPostPolicyV4(options);
+  
+  // After upload is complete, we need to set the metadata separately
+  // Create a function to set metadata after upload
+  const setMetadataAfterUpload = async () => {
+    try {
+      // Try multiple times with increasing delays
+      const maxRetries = 5;
+      let retryCount = 0;
+      let success = false;
+      
+      while (retryCount < maxRetries && !success) {
+        try {
+          // Increase wait time with each retry
+          const waitTime = 2000 + (retryCount * 2000); // 2s, 4s, 6s, 8s, 10s
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          
+          // Check if file exists
+          const [exists] = await newFile.exists();
+          if (exists && userIds.length > 0) {
+            // Set metadata on the file
+            // For Google Cloud Storage, metadata needs to be stored as strings
+            const metadataToSet = {
+              metadata: {
+                createdBy: JSON.stringify(userIds.map(id => id.toString())),
+                ...metadata
+              }
+            };
+            
+            await newFile.setMetadata(metadataToSet);
+            
+            // Verify metadata was set correctly
+            const [updatedMetadata] = await newFile.getMetadata();
+            
+            if (updatedMetadata.metadata && updatedMetadata.metadata.createdBy) {
+              try {
+                const savedCreatedBy = JSON.parse(updatedMetadata.metadata.createdBy);
+                
+                // Check if at least one of our user IDs is in the saved createdBy array
+                const hasUserIds = userIds.some(id => 
+                  savedCreatedBy.includes(id.toString())
+                );
+                
+                if (hasUserIds) {
+                  success = true;
+                }
+              } catch (parseError) {
+                // Continue to next attempt if parsing fails
+              }
+            }
+          }
+        } catch (err) {
+          // Skip this attempt and try again
+        }
+        
+        retryCount++;
+      }
+    } catch (error) {
+      // Silently fail - we don't want to block the upload process
+      // if metadata setting fails
+    }
+  };
+  
+  // Start the metadata setting process without waiting for it
+  // This allows us to return the upload URL immediately
+  setMetadataAfterUpload();
+    return {
+      url: response.url,
+      fields: response.fields,
+      filePath: filePath,
+      success: true,
+    };
+  // } catch (error) {
+  //   console.error("Error generating upload URL:", error);
+  //   return {
+  //     success: false,
+  //     error: "Failed to generate upload URL",
+  //     details: error.message,
+  //   };
+  // }
+};
+
+const deleteFile = async (filepath) => {
+  // List files under the specified path
+  const [files] = await bucket.getFiles({ prefix: filepath });
+  // Delete each file
+  await Promise.all(files.map((file) => file.delete()));
+
+  return { deleted: true };
+};
+
+const updateGcpFolderMetadata = async (folderName, AddedUserId, orderId) => {
+  const Order = require("../models/order.model");
+  const order = await Order.findById(orderId);
+
+  if (!order) {
+    console.error('❌ Order not found for metadata update:', orderId);
+    return { error: "order-not-found" };
+  }
+
+  // IMPORTANT: Use the stored folder path from order.file_path.dir_name if available
+  // This ensures we find the exact folder that was created, regardless of how the name was constructed
+  let file_path;
+
+  if (order.file_path && order.file_path.dir_name) {
+    // Use the stored folder path - most reliable method
+    file_path = order.file_path.dir_name;
+    console.log('📁 Using stored folder path from order:', file_path);
+  } else {
+    // Fallback: reconstruct the folder path (may not match if naming conventions changed)
+    const inCluededOrderId = getLastFiveChars(orderId);
+
+    // Get user name for folder naming (use guest name if no client_id)
+    let userName = "User";
+    if (order.client_id) {
+      try {
+        const userService = require("./user.service");
+        const client = await userService.getUserById(order.client_id);
+        if (client && client.name) {
+          userName = client.name.split(' ')[0]; // First name only
+        }
+      } catch (error) {
+        console.error("Error fetching client name for folder:", error.message);
+      }
+    } else if (order.guest_info?.name) {
+      userName = order.guest_info.name.split(' ')[0]; // First name only
+    }
+
+    // Get service type for folder naming
+    const serviceType = order.service_type || order.content_vertical || "Photography";
+
+    // Create the folder path
+    file_path = `${userName}'s ${serviceType}_${inCluededOrderId}`;
+    console.log('📁 Reconstructed folder path (fallback):', file_path);
+  }
+
+  const folder = bucket.file(`shoots/${file_path}/`);
+
+  try {
+    // Check if the folder exists
+    const [exists] = await folder.exists();
+    if (!exists) {
+      return { error: "folder-not-found" };
+    }
+
+    const [metadata] = await folder.getMetadata();
+    let currentCpIds = [];
+    if (metadata.metadata && metadata.metadata.createdBy) {
+      try {
+        currentCpIds = JSON.parse(metadata.metadata.createdBy);
+      } catch (e) {
+        console.error("Error parsing current createdBy metadata:", e);
+      }
+    }
+    // Update cpIds
+    const updatedCpIds = [...new Set([...currentCpIds, AddedUserId])];
+    // Preserve existing metadata and update createdBy
+    const updatedMetadata = {
+      ...metadata.metadata,
+      createdBy: JSON.stringify(updatedCpIds),
+      orderId: JSON.stringify(orderId),
+    };
+
+    const options = {
+      metadata: updatedMetadata,
+    };
+
+    await folder.setMetadata(options);
+
+    // Also update the database record to ensure access control works
+    const { FileMeta } = require("../models");
+    const pathWithoutPrefix = file_path + "/";
+
+    console.log('📁 Looking for folder in database with path:', pathWithoutPrefix);
+
+    // Try multiple path formats to find the folder
+    let folderRecord = await FileMeta.findOne({ path: pathWithoutPrefix });
+
+    // If not found with trailing slash, try without
+    if (!folderRecord) {
+      folderRecord = await FileMeta.findOne({ path: file_path });
+    }
+
+    // If still not found, try to find by orderId in metadata
+    if (!folderRecord) {
+      folderRecord = await FileMeta.findOne({
+        'metadata.orderId': orderId,
+        isFolder: true
+      });
+    }
+
+    if (folderRecord) {
+      console.log('📁 Found folder record:', folderRecord._id, 'path:', folderRecord.path);
+
+      // Update the cpIds in the database metadata
+      if (!folderRecord.metadata) {
+        folderRecord.metadata = { cpIds: [], orderId: orderId };
+      }
+
+      // Add the new user ID to the cpIds array if not already present
+      // Convert IDs to strings for comparison to handle ObjectId vs String
+      const existingCpIds = folderRecord.metadata.cpIds || [];
+      const addedUserIdStr = AddedUserId?.toString();
+      const cpIdExists = existingCpIds.some(cp => {
+        const cpIdStr = (cp.id || cp)?.toString();
+        return cpIdStr === addedUserIdStr;
+      });
+
+      if (!cpIdExists) {
+        // Add the new CP ID to the array (store as string for consistency)
+        const newCpObj = { id: addedUserIdStr };
+        folderRecord.metadata.cpIds = [...existingCpIds, newCpObj];
+        folderRecord.metadata.orderId = orderId;
+        folderRecord.markModified('metadata');
+        await folderRecord.save();
+        console.log('✅ Database metadata updated for folder:', folderRecord._id, 'added CP:', addedUserIdStr);
+      } else {
+        console.log('ℹ️ CP already exists in folder metadata:', addedUserIdStr);
+      }
+    } else {
+      console.log('⚠️ Folder record not found in database for path:', pathWithoutPrefix);
+
+      // Create the FileMeta record if it doesn't exist
+      try {
+        const newFolderRecord = await FileMeta.create({
+          path: pathWithoutPrefix,
+          name: file_path.split('/').pop() || file_path,
+          userId: order.client_id,
+          isFolder: true,
+          contentType: 'folder',
+          size: 0,
+          isPublic: false,
+          fullPath: `shoots/${pathWithoutPrefix}`,
+          metadata: {
+            cpIds: [{ id: AddedUserId?.toString() }],
+            orderId: orderId
+          }
+        });
+        console.log('✅ Created new folder record in database:', newFolderRecord._id);
+      } catch (createError) {
+        console.error('❌ Failed to create folder record:', createError.message);
+      }
+    }
+
+    return { updated: true };
+  } catch (error) {
+    console.error('Error in updateGcpFolderMetadata:', error);
+    return { error: "update-error" };
+  }
+};
+
+//
+const removeCpFromMetadata = async (folderName, cpIdToRemove, orderId) => {
+  const Order = require("../models/order.model");
+  const order = await Order.findById(orderId);
+
+  if (!order) {
+    console.error('❌ Order not found for CP removal:', orderId);
+    return { error: "order-not-found" };
+  }
+
+  // IMPORTANT: Use the stored folder path from order.file_path.dir_name if available
+  let file_path;
+
+  if (order.file_path && order.file_path.dir_name) {
+    file_path = order.file_path.dir_name;
+    console.log('📁 Using stored folder path for CP removal:', file_path);
+  } else {
+    // Fallback: reconstruct the folder path
+    const inCluededOrderId = getLastFiveChars(orderId);
+
+    let userName = "User";
+    if (order.client_id) {
+      try {
+        const userService = require("./user.service");
+        const client = await userService.getUserById(order.client_id);
+        if (client && client.name) {
+          userName = client.name.split(' ')[0];
+        }
+      } catch (error) {
+        console.error("Error fetching client name for folder:", error.message);
+      }
+    } else if (order.guest_info?.name) {
+      userName = order.guest_info.name.split(' ')[0];
+    }
+
+    const serviceType = order.service_type || order.content_vertical || "Photography";
+    file_path = `${userName}'s ${serviceType}_${inCluededOrderId}`;
+    console.log('📁 Reconstructed folder path for CP removal:', file_path);
+  }
+
+  const folder = bucket.file(`shoots/${file_path}/`);
+
+  try {
+    // Check if the folder exists
+    const [exists] = await folder.exists();
+    if (!exists) {
+      return { error: "folder-not-found" };
+    }
+
+    const [metadata] = await folder.getMetadata();
+    let currentCpIds = [];
+    if (metadata.metadata && metadata.metadata.createdBy) {
+      try {
+        currentCpIds = JSON.parse(metadata.metadata.createdBy);
+      } catch (e) {
+        console.error("Error parsing current createdBy metadata:", e);
+      }
+    }
+
+    // Remove the CP from the current list
+    const updatedCpIds = currentCpIds.filter((cpId) => cpId !== cpIdToRemove);
+
+    // Preserve existing metadata and update createdBy
+    const updatedMetadata = {
+      ...metadata.metadata,
+      createdBy: JSON.stringify(updatedCpIds),
+      orderId: JSON.stringify(orderId),
+    };
+
+    const options = {
+      metadata: updatedMetadata,
+    };
+
+    await folder.setMetadata(options);
+
+    // Also update the database record to ensure access control works
+    const { FileMeta } = require("../models");
+    const pathWithoutPrefix = file_path + "/";
+    const folderRecord = await FileMeta.findOne({ path: pathWithoutPrefix });
+
+    if (folderRecord) {
+      // Remove the CP ID from the database metadata
+      if (folderRecord.metadata && folderRecord.metadata.cpIds) {
+        const existingCpIds = folderRecord.metadata.cpIds || [];
+        folderRecord.metadata.cpIds = existingCpIds.filter(cp => cp.id !== cpIdToRemove);
+        await folderRecord.save();
+        console.log('✅ Database metadata updated (CP removed) for folder:', folderRecord._id);
+      }
+    }
+
+    return { updated: true };
+  } catch (error) {
+    return { error: "update-error" };
+  }
+};
+/**
+ * Get all content for a specific user using the fixed folder path
+ * @param {string} userId - The ID of the user
+ * @returns {Promise<Object>} - Object containing file URLs
+ */
+const getCpsContent = async (userId) => {
+  // Use the fixed folder path we established for uploads
+  const folderPath = `ProfileInfo/${userId}/Images/cp-content`;
+
+  try {
+    // Get all files in the folder
+    const [files] = await bucket.getFiles({ prefix: folderPath });
+    
+    // Generate public URLs for each file
+    const fileUrls = files.map(file => {
+      return {
+        name: file.name.split('/').pop(), // Extract just the filename
+        url: `https://storage.googleapis.com/${bucket.name}/${file.name}`,
+        uploadedAt: file.metadata?.timeCreated || null,
+        size: parseInt(file.metadata?.size) || 0,
+        contentType: file.metadata?.contentType || 'application/octet-stream'
+      };
+    });
+
+    // Sort files by upload date (newest first)
+    fileUrls.sort((a, b) => {
+      if (!a.uploadedAt || !b.uploadedAt) return 0;
+      return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+    });
+
+    return { 
+      success: true,
+      files: fileUrls,
+      count: fileUrls.length
+    };
+  } catch (error) {
+    console.error("Error fetching files:", error);
+    return { 
+      success: false, 
+      error: "Failed to fetch files",
+      message: error.message
+    };
+  }
+};
+/**
+ * Get content from the cp-content folder for a specific user
+ * @param {string} userId - The ID of the user
+ * @returns {Promise<Object>} - Object containing file URLs
+ */
+const getCpContent = async (userId) => {
+  // Use the fixed folder path for cp-content
+  const folderPath = `ProfileInfo/${userId}/cp-content`;
+
+  try {
+    // Get all files in the folder
+    const [files] = await bucket.getFiles({ prefix: folderPath });
+    
+    // Generate public URLs for each file
+    const fileUrls = files.map(file => {
+      return {
+        name: file.name.split('/').pop(), // Extract just the filename
+        url: `https://storage.googleapis.com/${bucket.name}/${file.name}`,
+        uploadedAt: file.metadata?.timeCreated || null,
+        size: parseInt(file.metadata?.size) || 0,
+        contentType: file.metadata?.contentType || 'application/octet-stream'
+      };
+    });
+
+    // Sort files by upload date (newest first)
+    fileUrls.sort((a, b) => {
+      if (!a.uploadedAt || !b.uploadedAt) return 0;
+      return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+    });
+
+    return { 
+      success: true,
+      files: fileUrls,
+      count: fileUrls.length
+    };
+  } catch (error) {
+    console.error("Error fetching cp-content files:", error);
+    return { 
+      success: false, 
+      error: "Failed to fetch files",
+      message: error.message
+    };
+  }
+};
+
+const deleteCpsContent = (fileUrls) => {
+  return Promise.all(
+    fileUrls.map((fileUrl) => {
+      // Extract the file path from the full URL
+      const filePath = fileUrl.replace(
+        `https://storage.googleapis.com/${bucket.name}/`,
+        ""
+      );
+      return bucket.file(filePath).delete();
+    })
+  );
+};
+
+/**
+ * Get the 10 most recently uploaded files with comprehensive metadata including user details
+ * @param {string} userId - Optional user ID to filter files by creator
+ * @returns {Promise<Array>} Array of file objects with detailed metadata and user information
+ */
+const getRecentFiles = async (userId = null) => {
+  try {
+    // Get all files from the shoots directory
+    const [files] = await bucket.getFiles({ prefix: "shoots/" });
+
+    // Sort files by last modified time (newest first)
+    const sortedFiles = files
+      .filter((file) => !file.name.endsWith("/")) // Filter out folders
+      .sort((a, b) => {
+        // Sort by updated time if available, otherwise by creation time
+        const timeA = new Date(a.metadata.updated || a.metadata.timeCreated);
+        const timeB = new Date(b.metadata.updated || b.metadata.timeCreated);
+        return timeB - timeA; // Sort in descending order (newest first)
+      });
+
+    // If userId is provided, we'll need to filter files after getting their metadata
+    // We'll collect all files first, then filter and take the top 10
+    let filesToProcess = sortedFiles;
+
+    // Format the response with comprehensive metadata
+    const allFormattedFiles = await Promise.all(
+      filesToProcess.map(async (file) => {
+        // Get full metadata for each file
+        const [metadata] = await file.getMetadata();
+        const publicUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
+
+        // Format file size in a human-readable format
+        const sizeInBytes = parseInt(metadata.size || 0, 10);
+        let formattedSize = sizeInBytes + " B";
+        if (sizeInBytes >= 1024) {
+          formattedSize = (sizeInBytes / 1024).toFixed(2) + " KB";
+        }
+        if (sizeInBytes >= 1024 * 1024) {
+          formattedSize = (sizeInBytes / (1024 * 1024)).toFixed(2) + " MB";
+        }
+
+        // Format dates in a readable format
+        const createdDate = new Date(metadata.timeCreated);
+        const updatedDate = metadata.updated
+          ? new Date(metadata.updated)
+          : null;
+
+        // Extract user IDs from createdBy metadata
+        let createdByUserIds = [];
+        let parentFolderMetadata = null;
+
+        // If this is a file inside a folder, we need to get the folder's metadata
+        // since user IDs are typically stored at the folder level
+        const filePath = file.name;
+        const folderPath = filePath.substring(0, filePath.lastIndexOf("/") + 1);
+
+        // First check if the file itself has createdBy metadata
+        if (metadata.metadata && metadata.metadata.createdBy) {
+          try {
+            console.log('File metadata.createdBy raw value:', metadata.metadata.createdBy);
+            
+            // Handle different formats of createdBy metadata
+            if (typeof metadata.metadata.createdBy === 'string') {
+              try {
+                // Try to parse as JSON first
+                createdByUserIds = JSON.parse(metadata.metadata.createdBy);
+                console.log('Successfully parsed createdBy as JSON:', createdByUserIds);
+              } catch (parseError) {
+                // If parsing fails, treat as a single string ID
+                console.log('createdBy is a string but not JSON, using as single ID');
+                createdByUserIds = [metadata.metadata.createdBy];
+              }
+            } else if (Array.isArray(metadata.metadata.createdBy)) {
+              // If it's already an array, use it directly
+              console.log('createdBy is already an array');
+              createdByUserIds = metadata.metadata.createdBy;
+            }
+            
+            // Ensure it's an array at this point
+            if (!Array.isArray(createdByUserIds)) {
+              console.log('createdBy is not an array after processing, converting to empty array');
+              createdByUserIds = [];
+            }
+          } catch (e) {
+            console.error("Error processing file createdBy metadata:", e);
+            createdByUserIds = [];
+          }
+        } else {
+          console.log('No createdBy metadata found for file:', filePath);
+        }
+
+        // If no user IDs found in the file, try to get them from the parent folder
+        if (createdByUserIds.length === 0 && folderPath !== filePath) {
+          try {
+            const folder = bucket.file(folderPath);
+            const [folderExists] = await folder.exists();
+
+            if (folderExists) {
+              const [folderMetadata] = await folder.getMetadata();
+              parentFolderMetadata = folderMetadata;
+
+              if (
+                folderMetadata.metadata &&
+                folderMetadata.metadata.createdBy
+              ) {
+                try {
+                  const folderCreatedBy = JSON.parse(
+                    folderMetadata.metadata.createdBy
+                  );
+                  // If it's a string but not an array, convert to array
+                  if (Array.isArray(folderCreatedBy)) {
+                    createdByUserIds = folderCreatedBy;
+                  } else if (typeof folderCreatedBy === "string") {
+                    createdByUserIds = [folderCreatedBy];
+                  }
+                } catch (e) {
+                  console.error("Error parsing folder createdBy metadata:", e);
+                }
+              }
+            }
+          } catch (e) {
+            console.error("Error getting folder metadata:", e);
+          }
+        }
+
+        // Extract order ID if available
+        let orderId = null;
+        // First check file metadata
+        if (metadata.metadata && metadata.metadata.orderId) {
+          try {
+            orderId = JSON.parse(metadata.metadata.orderId);
+          } catch (e) {
+            console.error("Error parsing file orderId metadata:", e);
+          }
+        }
+
+        // If no order ID found in file, check parent folder metadata
+        if (
+          !orderId &&
+          parentFolderMetadata &&
+          parentFolderMetadata.metadata &&
+          parentFolderMetadata.metadata.orderId
+        ) {
+          try {
+            orderId = JSON.parse(parentFolderMetadata.metadata.orderId);
+          } catch (e) {
+            console.error("Error parsing folder orderId metadata:", e);
+          }
+        }
+
+        // Fetch user details for each creator ID
+        const userDetails = await Promise.all(
+          createdByUserIds.map(async (userId) => {
+            try {
+              // Get user information from the database
+              const user = await userService.getUserById(userId);
+
+              if (user) {
+                return {
+                  userId: user._id.toString(),
+                  name: user.name,
+                  email: user.email,
+                  role: user.role,
+                  profilePicture: user.profile_picture || null,
+                };
+              }
+              return null;
+            } catch (error) {
+              console.error(
+                `Error fetching user details for ID ${userId}:`,
+                error
+              );
+              return null;
+            }
+          })
+        );
+
+        // Filter out null values (users not found)
+        const validUserDetails = userDetails.filter((user) => user !== null);
+
+        return {
+          name: file.name.split("/").pop(), // Get just the filename
+          path: file.name, // Full path in storage
+          fullPath: `https://storage.googleapis.com/${bucket.name}/${file.name}`, // Full URL path
+          size: {
+            bytes: sizeInBytes,
+            formatted: formattedSize,
+          },
+          contentType: metadata.contentType,
+          dates: {
+            created: {
+              raw: metadata.timeCreated,
+              formatted: createdDate.toLocaleString(),
+            },
+            updated: updatedDate
+              ? {
+                  raw: metadata.updated,
+                  formatted: updatedDate.toLocaleString(),
+                }
+              : null,
+          },
+          users: {
+            createdBy: createdByUserIds, // Array of user IDs who created this file
+            orderId: orderId, // The order ID associated with this file
+            details: validUserDetails, // Detailed user information including profile pictures
+          },
+          metadata: {
+            // Include standard metadata
+            generation: metadata.generation,
+            metageneration: metadata.metageneration,
+            etag: metadata.etag,
+            storageClass: metadata.storageClass,
+            // Include custom metadata if available
+            custom: metadata || {},
+          },
+          url: publicUrl,
+          isPublic:
+            metadata.acl &&
+            metadata.acl.some((acl) => acl.entity === "allUsers"),
+        };
+      })
+    );
+
+    // If userId is provided, filter files by that user
+    let filteredFiles = allFormattedFiles;
+
+    if (userId) {
+      try {
+        // Convert userId to string for consistent comparison
+        const userIdStr = userId.toString();
+        
+        // First, identify all folders that the user has access to
+        const accessibleFolders = allFormattedFiles
+          .filter(file => {
+            try {
+              // Check if this is a folder (ends with /)
+              if (!file.path.endsWith('/')) return false;
+              
+              // Check if user has access to this folder based on createdBy field
+              if (file.users && file.users.createdBy) {
+                // Handle different formats of the createdBy field
+                // Case 1: createdBy is an array
+                if (Array.isArray(file.users.createdBy)) {
+                  return file.users.createdBy.some(id => id && id.toString() === userIdStr);
+                }
+                
+                // Case 2: createdBy is a JSON string
+                if (typeof file.users.createdBy === 'string') {
+                  try {
+                    const createdByArray = JSON.parse(file.users.createdBy);
+                    if (Array.isArray(createdByArray)) {
+                      return createdByArray.some(id => id && id.toString() === userIdStr);
+                    }
+                  } catch (e) {
+                    // If parsing fails, check if the string itself matches
+                    return file.users.createdBy === userIdStr;
+                  }
+                }
+              }
+              return false;
+            } catch (error) {
+              // Skip this folder if there's an error processing it
+              return false;
+            }
+          })
+          .map(folder => folder.path);
+        
+        // Then filter files to include:
+        // 1. Files where the user is in the createdBy array OR
+        // 2. Files that are in a folder where the user has access
+        filteredFiles = allFormattedFiles.filter((file) => {
+          try {
+            // Check if the user ID is in the createdBy array
+            if (file.users && file.users.createdBy) {
+              // Case 1: createdBy is already an array
+              if (Array.isArray(file.users.createdBy)) {
+                if (file.users.createdBy.some(id => id && id.toString() === userIdStr)) {
+                  return true;
+                }
+              }
+              
+              // Case 2: createdBy is a JSON string
+              if (typeof file.users.createdBy === 'string') {
+                try {
+                  const createdByArray = JSON.parse(file.users.createdBy);
+                  if (Array.isArray(createdByArray) && 
+                      createdByArray.some(id => id && id.toString() === userIdStr)) {
+                    return true;
+                  }
+                } catch (e) {
+                  // If parsing fails, check if the string itself matches
+                  if (file.users.createdBy === userIdStr) {
+                    return true;
+                  }
+                }
+              }
+            }
+            
+            // Check if the file is in a folder that the user has access to
+            return accessibleFolders.some(folderPath => 
+              file.path.startsWith(folderPath) && file.path !== folderPath
+            );
+          } catch (error) {
+            // Skip this file if there's an error processing it
+            return false;
+          }
+        });
+      } catch (error) {
+        // If there's an error in the filtering process, return all files
+        // This is a fallback to ensure the API doesn't fail completely
+        filteredFiles = allFormattedFiles;
+      }
+    }
+    
+    // Take only the first 10 files after filtering
+    return filteredFiles.length > 0 ? filteredFiles.slice(0, 10) : [];
+  } catch (error) {
+    console.error("Error fetching recent files:", error);
+    throw new ApiError(
+      httpStatus.INTERNAL_SERVER_ERROR,
+      "Failed to fetch recent files"
+    );
+  }
+};
+
+/**
+ * Get files for a specific order ID
+ * @param {string} orderId - The order ID
+ * @returns {Promise<Object>} - Object containing files in the order's folder
+ */
+const getFilesByOrderIdold = async (orderId) => {
+  try {
+    // Get the order details to generate the folder name
+    const { Order } = require("../models");
+    const getLastFiveChars = require("../utils/getLastFiveCharc");
+
+    // Find the order
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return {
+        success: false,
+        error: "Order not found",
+      };
+    }
+
+    // Generate folder name using the same logic as in order.service.js
+    const inCluededOrderId = getLastFiveChars(order.id);
+    const folderName = order.order_name + "_" + inCluededOrderId;
+
+    // Get files from the folder
+    const folderPath = `shoots/${folderName}/`;
+
+    // Get files from GCS with the folder prefix
+    const [files] = await bucket.getFiles({ prefix: folderPath });
+
+    // Format the response
+    const filesResponse = files.map((file) => {
+      // Get the filename from the path
+      const pathParts = file.name.split("/");
+      const fileName =
+        pathParts[pathParts.length - 1] ||
+        pathParts[pathParts.length - 2] ||
+        "";
+
+      // Format file size
+      const sizeInBytes = parseInt(file.metadata.size || 0, 10);
+      let formattedSize = sizeInBytes + " B";
+      if (sizeInBytes >= 1024) {
+        formattedSize = (sizeInBytes / 1024).toFixed(2) + " KB";
+      }
+      if (sizeInBytes >= 1024 * 1024) {
+        formattedSize = (sizeInBytes / (1024 * 1024)).toFixed(2) + " MB";
+      }
+
+      // Extract metadata
+      let createdByArray = [];
+      const createdBy = file.metadata?.metadata?.createdBy;
+
+      if (createdBy) {
+        try {
+          // Try to parse as JSON
+          createdByArray = JSON.parse(createdBy);
+          // If it's not an array, convert to array
+          if (!Array.isArray(createdByArray)) {
+            createdByArray = [createdBy];
+          }
+        } catch (e) {
+          // If parsing fails, treat as a single string ID
+          createdByArray = [createdBy];
+        }
+      }
+      console.log('createdByArray:', file);
+      // Return only the requested fields
+      return {
+        contentType: file.metadata.contentType || "",
+        downloadLink: file.metadata.mediaLink,
+        path: file.name.replace("shoots/", ""),
+        name: fileName,
+        url: `https://storage.googleapis.com/${
+          bucket.name
+        }/${encodeURIComponent(file.name)}`,
+        fullPath: file.name,
+        createdBy: createdByArray,
+        metaId: file.metadata.generation,
+      };
+    });
+
+    return {
+      success: true,
+      orderId: orderId,
+      orderName: order.order_name,
+      folderName: folderName,
+      folderPath: folderPath,
+      files: filesResponse,
+      totalFiles: filesResponse.length,
+    };
+  } catch (error) {
+    console.error("Error fetching files for order:", error);
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+};
+const getFilesByOrderId = async (orderId) => {
+  try {
+    // Get the order details to generate the folder name
+    const { Order } = require("../models");
+    const getLastFiveChars = require("../utils/getLastFiveCharc");
+
+    // Find the order
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return {
+        success: false,
+        error: "Order not found",
+      };
+    }
+
+    // Generate folder name using the same logic as in order.service.js
+    const inCluededOrderId = getLastFiveChars(order.id);
+    const folderName = order.order_name + "_" + inCluededOrderId;
+
+    // Get files from the folder
+    const folderPath = `shoots/${folderName}/`;
+
+    // Get files from GCS with the folder prefix
+    const [files] = await bucket.getFiles({ prefix: folderPath });
+
+    // Format the response
+    const filesResponse = files
+      .filter(file => !file.name.endsWith('/')) // Filter out folders
+      .map((file) => {
+        // Get the filename from the path
+        const pathParts = file.name.split("/");
+        const fileName =
+          pathParts[pathParts.length - 1] ||
+          pathParts[pathParts.length - 2] ||
+          "";
+
+        // Format file size
+        const sizeInBytes = parseInt(file.metadata.size || 0, 10);
+        let formattedSize = sizeInBytes + " B";
+        if (sizeInBytes >= 1024) {
+          formattedSize = (sizeInBytes / 1024).toFixed(2) + " KB";
+        }
+        if (sizeInBytes >= 1024 * 1024) {
+          formattedSize = (sizeInBytes / (1024 * 1024)).toFixed(2) + " MB";
+        }
+
+        // Extract metadata
+        let createdByArray = [];
+        const createdBy = file.metadata?.metadata?.createdBy;
+
+        if (createdBy) {
+          try {
+            // Try to parse as JSON
+            createdByArray = JSON.parse(createdBy);
+            // If it's not an array, convert to array
+            if (!Array.isArray(createdByArray)) {
+              createdByArray = [createdBy];
+            }
+          } catch (e) {
+            // If parsing fails, treat as a single string ID
+            createdByArray = [createdBy];
+          }
+        }
+        
+        // Return only the requested fields
+        return {
+          contentType: file.metadata.contentType || "",
+          downloadLink: file.metadata.mediaLink,
+          path: file.name.replace("shoots/", ""),
+          name: fileName,
+          url: `https://storage.googleapis.com/${
+            bucket.name
+          }/${encodeURIComponent(file.name)}`,
+          fullPath: file.name,
+          createdBy: createdByArray,
+          metaId: file.metadata.generation,
+        };
+      });
+
+    return {
+      success: true,
+      orderId: orderId,
+      orderName: order.order_name,
+      folderName: folderName,
+      folderPath: folderPath,
+      files: filesResponse,
+      totalFiles: filesResponse.length,
+    };
+  } catch (error) {
+    console.error("Error fetching files for order:", error);
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+};
+
+/**
+ * Make a file public by updating its ACL
+ * @param {string} filePath - Path to the file in GCS
+ * @returns {Promise<Object>} - Object containing success status and public URL
+ */
+const makeFilePublic = async (filePath) => {
+  try {
+    const file = bucket.file(filePath);
+
+    // Check if file exists
+    const [exists] = await file.exists();
+    if (!exists) {
+      return {
+        success: false,
+        error: "File not found",
+      };
+    }
+
+    // Make the file publicly accessible
+    await file.makePublic();
+
+    // Generate a public URL
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
+
+    return {
+      success: true,
+      publicUrl: publicUrl,
+    };
+  } catch (error) {
+    console.error("Error making file public:", error);
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+};
+module.exports = {
+  createFolder,
+  createChatFolder,
+  downloadFiles,
+  uploadFile,
+  deleteFile,
+  getFiles,
+  getChatFiles,
+  bucket,
+  updateGcpFolderMetadata,
+  removeCpFromMetadata,
+  getCpsContent,
+  getCpContent,
+  deleteCpsContent,
+  getUserSettings,
+  updateWithUserSettings,
+  getRecentFiles,
+  getFilesByOrderId,
+  makeFilePublic,
+};
