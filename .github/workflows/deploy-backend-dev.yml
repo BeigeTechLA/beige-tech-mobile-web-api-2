@@ -85,7 +85,7 @@ jobs:
           ssh -p "$PORT" -i ~/.ssh/backend-dev.pem "$BACKEND_DEV_USER@$BACKEND_DEV_HOST" << 'EOF'
           set -euo pipefail
           cd /var/www/beige-web-dev-2
-          npm install --omit=dev
+          npm install --omit=dev --ignore-scripts
           pm2 delete beige-web-dev-2 >/dev/null 2>&1 || true
           pm2 start npm --name beige-web-dev-2 -- start
           pm2 save
