@@ -12,6 +12,7 @@ let server = http.createServer(app);
 // teestsss
 //Start socket functionality
 startSocketServer(server);
+
 //End socket functionality
 
 mongoose.connect(config.mongoose.url, config.mongoose.options).then(() => {
