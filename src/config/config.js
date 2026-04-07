@@ -1,7 +1,9 @@
 const dotenv = require("dotenv");
 const path = require("path");
 const Joi = require("joi");
-const { en } = require("faker/lib/locales");
+const faker = require("faker");
+
+faker.locale = "en";
 
 dotenv.config({ path: path.join(__dirname, "../../.env") });
 
