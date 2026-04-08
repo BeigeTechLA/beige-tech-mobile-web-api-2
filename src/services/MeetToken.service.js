@@ -151,11 +151,15 @@ ${meetLink}`;
  * @param {function} callback Callback function with authorized OAuth2 client
  */
 async function authorize(callback) {
-  const { client_secret, client_id, redirect_uris } = credentials.installed;
+  const { client_secret, client_id } = credentials.installed;
+  
+  // Use the environment variable here instead of redirect_uris[0]
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI; 
+
   const oAuth2Client = new google.auth.OAuth2(
     client_id,
     client_secret,
-    redirect_uris[0]
+    redirectUri
   );
 
   try {
@@ -214,11 +218,15 @@ async function authorize(callback) {
  */
 const oauth2callback = async (code) => {
   if (code) {
-    const { client_secret, client_id, redirect_uris } = credentials.installed;
+    const { client_secret, client_id } = credentials.installed;
+    
+    // Use the same environment variable here
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+
     const oAuth2Client = new google.auth.OAuth2(
       client_id,
       client_secret,
-      redirect_uris[0]
+      redirectUri
     );
     try {
       const { tokens } = await oAuth2Client.getToken(code);
