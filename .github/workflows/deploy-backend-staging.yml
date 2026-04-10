@@ -54,7 +54,7 @@ jobs:
           PORT="${BACKEND_STAGING_PORT:-22}"
           ssh -p "$PORT" -i ~/.ssh/backend-staging.pem \
             "$BACKEND_STAGING_USER@$BACKEND_STAGING_HOST" \
-            sudo mkdir -p /var/www/beige-web-staging-2 && sudo chown -R $BACKEND_STAGING_USER:$BACKEND_STAGING_USER /var/www/beige-web-staging-2
+            "sudo mkdir -p /var/www/beige-web-staging-2 && sudo chown -R $BACKEND_STAGING_USER:$BACKEND_STAGING_USER /var/www/beige-web-staging-2"
 
       - name: Upload backend code
         env:
