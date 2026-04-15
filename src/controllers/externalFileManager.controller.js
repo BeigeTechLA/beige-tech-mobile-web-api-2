@@ -674,15 +674,49 @@ exports.deleteEntry = async (req, res, next) => {
       });
     }
 
-    const targetPath = filePath.startsWith("Website_Shoots_Flow/")
-      ? filePath
-      : `Website_Shoots_Flow/${filePath}`;
+    const pathWithSlash = filePath.endsWith("/") ? filePath : `${filePath}/`;
+    const pathWithoutSlash = filePath.endsWith("/") ? filePath.slice(0, -1) : filePath;
+    const folderDoc = await FileMeta.findOne({
+      isFolder: true,
+      path: { $in: [pathWithSlash, pathWithoutSlash] },
+    }).lean();
+
+    const isFolderDelete = Boolean(folderDoc?.isFolder);
+    const effectivePath = isFolderDelete ? pathWithSlash : filePath;
+    const targetPath = effectivePath.startsWith("Website_Shoots_Flow/")
+      ? effectivePath
+      : `Website_Shoots_Flow/${effectivePath}`;
 
     const result = await gcpFileService.deleteFile(targetPath);
 
+    const escapedRoot = pathWithoutSlash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pathRegex = new RegExp(`^${escapedRoot}/`);
+    const extraDeleteFilter = {
+      $or: [
+        { path: pathWithSlash },
+        { path: pathWithoutSlash },
+        { path: pathRegex },
+      ],
+    };
+
+    const orderId = folderDoc?.metadata?.orderId;
+    if (orderId && isRootWorkspacePath(pathWithoutSlash)) {
+      extraDeleteFilter.$or.push({
+        isFolder: true,
+        parentFolderId: null,
+        path: { $regex: /^[^/]+\/?$/ },
+        "metadata.orderId": String(orderId),
+      });
+    }
+
+    const metadataCleanup = await FileMeta.deleteMany(extraDeleteFilter);
+
     return res.status(httpStatus.OK).json({
       success: true,
-      data: result,
+      data: {
+        ...result,
+        metadataDeletedCount: metadataCleanup.deletedCount || 0,
+      },
     });
   } catch (error) {
     return next(error);

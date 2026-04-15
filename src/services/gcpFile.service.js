@@ -118,9 +118,19 @@ async function setBucketCors() {
   CorsAlreadyChecked = true;
 }
 
-const createFolder = async (folderName, cpIds, orderId, client_id, shootName = null, clientName = null, shootId = null) => {
+const createFolder = async (
+  folderName,
+  cpIds,
+  orderId,
+  client_id,
+  shootName = null,
+  clientName = null,
+  shootId = null,
+  createOptions = {}
+) => {
   checkGcpEnabled();
   let options = {};
+  const shouldSkipWorkflowSubfolders = Boolean(createOptions?.skipWorkflowSubfolders);
 
   // Determine the userId - prioritize client_id, then try to extract from cpIds
   let userId = client_id;
@@ -274,9 +284,16 @@ const createFolder = async (folderName, cpIds, orderId, client_id, shootName = n
     // Create production workflow subfolders ONLY for client folders (not custom folders)
     // Client folders are identified by having an orderId, shootName, or clientName
     // Custom folders created manually by users should NOT have workflow subfolders
-    const isClientFolder = orderId || shootName || clientName;
+    const isClientFolder = Boolean(orderId || shootName || clientName);
+    const normalizedFolderPath = pathWithoutPrefix.replace(/\/$/, "");
+    const isRootFolder = !normalizedFolderPath.includes("/");
+    const shouldCreateWorkflowSubfolders =
+      folderDoc &&
+      isClientFolder &&
+      isRootFolder &&
+      !shouldSkipWorkflowSubfolders;
 
-    if (folderDoc && isClientFolder) {
+    if (shouldCreateWorkflowSubfolders) {
       try {
         await createProductionSubfolders(
           pathWithoutPrefix,
@@ -290,6 +307,10 @@ const createFolder = async (folderName, cpIds, orderId, client_id, shootName = n
         console.error('⚠️ Error creating production subfolders:', subfolderError);
         // Don't fail the main folder creation if subfolder creation fails
       }
+    } else if (folderDoc && shouldSkipWorkflowSubfolders) {
+      console.log('ℹ️ Skipping workflow subfolder creation - explicitly disabled for this request');
+    } else if (folderDoc && !isRootFolder) {
+      console.log('ℹ️ Skipping workflow subfolder creation - this is a nested folder');
     } else if (folderDoc) {
       console.log('ℹ️ Skipping workflow subfolder creation - this is a custom folder, not a client folder');
     }

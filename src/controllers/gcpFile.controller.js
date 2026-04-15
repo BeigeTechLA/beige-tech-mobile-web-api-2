@@ -430,6 +430,8 @@ const addFolder = catchAsync(async (req, res) => {
 
     // Extract userId from authenticated user
     const authenticatedUserId = req.user?.id || req.user?._id;
+    const authenticatedUserRole = req.user?.role;
+    const isCpFolderCreation = authenticatedUserRole === "cp" || authenticatedUserRole === "service_provider";
 
     console.log('📁 Creating folder:', folderName || folderpath, 'for user:', authenticatedUserId);
 
@@ -543,7 +545,11 @@ const addFolder = catchAsync(async (req, res) => {
       pathToCreate,
       inheritedCpIds, // Pass inherited cpIds (or null for root folders)
       inheritedOrderId, // Pass inherited orderId (or null for root folders)
-      inheritedUserId // Pass inherited userId (parent's owner or authenticated user)
+      inheritedUserId, // Pass inherited userId (parent's owner or authenticated user)
+      null,
+      null,
+      null,
+      { skipWorkflowSubfolders: isCpFolderCreation }
     );
 
     if (result.error) {
