@@ -10,6 +10,7 @@ module.exports.Meeting = require("./meeting.model");
 module.exports.Dispute = require("./dispute.model");
 module.exports.File = require("./file.model");
 module.exports.FileMeta = require("./fileMeta.model");
+module.exports.FaceEmbedding = require("./faceEmbedding.model");
 module.exports.FcmToken = require("./fcmToken.model");
 module.exports.Rating = require("./rating.model");
 module.exports.AlgoSetting = require("./settings/algo.model");

@@ -1,12 +1,135 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta } = require("../models");
+const { FileMeta, FaceEmbedding } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
+
+const FACE_SCAN_SERVICE_URL = process.env.FACE_SCAN_SERVICE_URL || "http://localhost:8000";
+const FACE_SCAN_PROVIDER_TIMEOUT_MS = Math.max(
+  15000,
+  Number(process.env.FACE_SCAN_PROVIDER_TIMEOUT_MS || 3000000)
+);
+const FACE_SCAN_MAX_CANDIDATES = Math.max(25, Number(process.env.FACE_SCAN_MAX_CANDIDATES || 80));
+const FACE_SCAN_FALLBACK_MAX_CANDIDATES = Math.max(
+  50,
+  Number(process.env.FACE_SCAN_FALLBACK_MAX_CANDIDATES || 400)
+);
+const FACE_SCAN_INDEX_CONCURRENCY = Math.max(1, Number(process.env.FACE_SCAN_INDEX_CONCURRENCY || 3));
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const isImageLikePath = (value = "") =>
+  /\.(jpg|jpeg|png|webp|heic|heif|bmp)$/i.test(String(value || "").toLowerCase());
+
+const isImageLikeFile = (file = {}) => {
+  const contentType = String(file.contentType || file.mimeType || "").toLowerCase();
+  if (contentType.startsWith("image/")) return true;
+  return isImageLikePath(file.path || file.name || "");
+};
+
+const toPositiveInteger = (value, fallback) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.floor(parsed));
+};
+
+const runWithConcurrency = async (items = [], concurrency = 3, task = async () => null) => {
+  const workers = Math.max(1, Number(concurrency) || 1);
+  let cursor = 0;
+
+  const runner = async () => {
+    while (cursor < items.length) {
+      const current = cursor;
+      cursor += 1;
+      // eslint-disable-next-line no-await-in-loop
+      await task(items[current], current);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(workers, Math.max(items.length, 1)) }, runner));
+};
+
+const cosineSimilarity = (vectorA = [], vectorB = []) => {
+  if (!Array.isArray(vectorA) || !Array.isArray(vectorB)) return 0;
+  if (!vectorA.length || !vectorB.length || vectorA.length !== vectorB.length) return 0;
+
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < vectorA.length; i += 1) {
+    const a = Number(vectorA[i] || 0);
+    const b = Number(vectorB[i] || 0);
+    dot += a * b;
+    normA += a * a;
+    normB += b * b;
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB) + 1e-8;
+  const raw = dot / denominator;
+  return Math.max(0, Math.min(1, (raw + 1) / 2));
+};
+
+const getBestFacePairScore = (queryEmbeddings = [], candidateEmbeddings = []) => {
+  let bestScore = 0;
+  let bestQueryIndex = -1;
+  let bestCandidateIndex = -1;
+
+  queryEmbeddings.forEach((queryEmbedding, queryIndex) => {
+    candidateEmbeddings.forEach((candidateEmbedding, candidateIndex) => {
+      const score = cosineSimilarity(queryEmbedding, candidateEmbedding);
+      if (score > bestScore) {
+        bestScore = score;
+        bestQueryIndex = queryIndex;
+        bestCandidateIndex = candidateIndex;
+      }
+    });
+  });
+
+  return {
+    score: bestScore,
+    queryFaceIndex: bestQueryIndex,
+    candidateFaceIndex: bestCandidateIndex,
+  };
+};
+
+const fetchFaceServicePayload = async (path, payload = {}, timeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${FACE_SCAN_SERVICE_URL.replace(/\/+$/, "")}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(payload),
+    });
+
+    const responsePayload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(
+        responsePayload?.detail || responsePayload?.message || "Face scan provider request failed"
+      );
+      error.status = response.status;
+      throw error;
+    }
+
+    return responsePayload;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`Face scan provider timed out after ${timeoutMs}ms`);
+      timeoutError.status = httpStatus.GATEWAY_TIMEOUT;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
 
 const encodePathForUrl = (value) =>
   String(value || "")
@@ -207,6 +330,237 @@ const getWorkspaceFileCount = async (rootPath) =>
     isFolder: false,
     path: { $regex: `^${escapeRegex(rootPath)}` },
   });
+
+const listWorkspaceImageCandidates = async (externalId) => {
+  const workspace = await findWorkspaceRoot(externalId);
+  if (!workspace) return [];
+
+  const docs = await FileMeta.find({
+    isFolder: false,
+    path: { $regex: `^${escapeRegex(workspace.path)}` },
+  })
+    .select("path name contentType mimeType updatedAt createdAt")
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .lean();
+
+  return docs
+    .filter(isImageLikeFile)
+    .map((doc) => ({
+      path: doc.path,
+      name: doc.name,
+      contentType: doc.contentType || doc.mimeType || "",
+      updatedAt: doc.updatedAt || doc.createdAt || null,
+    }));
+};
+
+const getFileSignedViewUrl = async (filepath) => {
+  const normalized = normalizeWorkspacePath(filepath);
+  if (!normalized) return "";
+  const downloadPayload = await gcpFileService.downloadFiles(
+    normalized.startsWith("Website_Shoots_Flow/") ? normalized : `Website_Shoots_Flow/${normalized}`,
+    false
+  );
+  return String(downloadPayload?.url || "");
+};
+
+const extractEmbeddingsFromPayload = (payload) => {
+  const embeddings = payload?.data?.embeddings || payload?.embeddings || [];
+  return Array.isArray(embeddings) ? embeddings : [];
+};
+
+const fetchEmbeddingsForImage = async ({ scanImageBase64, scanImageUrl, providerTimeoutMs }) => {
+  const payload = await fetchFaceServicePayload(
+    "/embed",
+    {
+      scanImageBase64: scanImageBase64 || undefined,
+      scanImageUrl: scanImageUrl || undefined,
+    },
+    providerTimeoutMs
+  );
+  return extractEmbeddingsFromPayload(payload);
+};
+
+const upsertFaceEmbedding = async ({
+  externalId,
+  filepath,
+  fileName = "",
+  contentType = "",
+  embeddings = [],
+  status = "ready",
+  errorMessage = null,
+}) => {
+  const normalizedExternalId = normalizeExternalId(externalId);
+  const normalizedPath = normalizeWorkspacePath(filepath);
+  if (!normalizedExternalId || !normalizedPath) return null;
+
+  return FaceEmbedding.findOneAndUpdate(
+    { filepath: normalizedPath },
+    {
+      $set: {
+        externalId: normalizedExternalId,
+        filepath: normalizedPath,
+        fileName: String(fileName || ""),
+        contentType: String(contentType || ""),
+        embeddings: Array.isArray(embeddings) ? embeddings : [],
+        facesCount: Array.isArray(embeddings) ? embeddings.length : 0,
+        status,
+        errorMessage: errorMessage ? String(errorMessage).slice(0, 255) : null,
+        indexedAt: new Date(),
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
+
+const indexEmbeddingForCandidate = async ({
+  externalId,
+  filepath,
+  fileName = "",
+  contentType = "",
+  providerTimeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS,
+}) => {
+  const normalizedPath = normalizeWorkspacePath(filepath);
+  const looksLikeImage =
+    String(contentType || "").toLowerCase().startsWith("image/") ||
+    isImageLikePath(fileName) ||
+    isImageLikePath(normalizedPath);
+
+  if (!normalizeExternalId(externalId) || !normalizedPath || !looksLikeImage) {
+    return { status: "skipped", reason: "not_image_or_invalid" };
+  }
+
+  try {
+    const scanImageUrl = await getFileSignedViewUrl(normalizedPath);
+    if (!scanImageUrl) {
+      await upsertFaceEmbedding({
+        externalId,
+        filepath: normalizedPath,
+        fileName,
+        contentType,
+        embeddings: [],
+        status: "failed",
+        errorMessage: "Missing file view URL",
+      });
+      return { status: "failed", reason: "missing_view_url" };
+    }
+
+    const embeddings = await fetchEmbeddingsForImage({ scanImageUrl, providerTimeoutMs });
+    if (!embeddings.length) {
+      await upsertFaceEmbedding({
+        externalId,
+        filepath: normalizedPath,
+        fileName,
+        contentType,
+        embeddings: [],
+        status: "failed",
+        errorMessage: "No face detected",
+      });
+      return { status: "failed", reason: "no_face" };
+    }
+
+    await upsertFaceEmbedding({
+      externalId,
+      filepath: normalizedPath,
+      fileName,
+      contentType,
+      embeddings,
+      status: "ready",
+      errorMessage: null,
+    });
+
+    return { status: "indexed", facesCount: embeddings.length };
+  } catch (error) {
+    await upsertFaceEmbedding({
+      externalId,
+      filepath: normalizedPath,
+      fileName,
+      contentType,
+      embeddings: [],
+      status: "failed",
+      errorMessage: error?.message || "Face indexing failed",
+    });
+    return { status: "failed", reason: error?.message || "Face indexing failed" };
+  }
+};
+
+const mergeFaceMatchesByBestScore = (matches = []) => {
+  const mergedMap = new Map();
+
+  matches.forEach((item) => {
+    const path = String(item?.path || "").trim();
+    if (!path) return;
+    const existing = mergedMap.get(path);
+    if (!existing || Number(item.score || 0) > Number(existing.score || 0)) {
+      mergedMap.set(path, item);
+    }
+  });
+
+  return Array.from(mergedMap.values()).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+};
+
+const runProviderFaceSearch = async ({
+  externalId,
+  scanImageBase64,
+  scanImageUrl,
+  threshold,
+  maxResults,
+  providerTimeoutMs,
+  candidates = [],
+}) => {
+  if (!Array.isArray(candidates) || !candidates.length) {
+    return {
+      scannedCandidatesCount: 0,
+      matches: [],
+      provider: "deepface",
+    };
+  }
+
+  const candidatesWithUrls = (
+    await Promise.all(
+      candidates.map(async (candidate) => {
+        try {
+          const url = await getFileSignedViewUrl(candidate.path);
+          if (!url) return null;
+          return {
+            path: candidate.path,
+            url,
+            name: candidate.name,
+          };
+        } catch (error) {
+          return null;
+        }
+      })
+    )
+  ).filter(Boolean);
+
+  if (!candidatesWithUrls.length) {
+    return {
+      scannedCandidatesCount: 0,
+      matches: [],
+      provider: "deepface",
+    };
+  }
+
+  const providerPayload = await fetchFaceServicePayload(
+    "/search",
+    {
+      externalId,
+      scanMode: "full_face_scan",
+      scanImageBase64: scanImageBase64 || undefined,
+      scanImageUrl: scanImageUrl || undefined,
+      candidates: candidatesWithUrls,
+      threshold,
+      maxResults,
+    },
+    providerTimeoutMs
+  );
+
+  return {
+    scannedCandidatesCount: candidatesWithUrls.length,
+    matches: providerPayload?.data?.matches || providerPayload?.matches || [],
+    provider: providerPayload?.data?.provider || providerPayload?.provider || "deepface",
+  };
+};
 
 const buildFolderDownloadUrl = (req, cleanPath) => {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
@@ -526,6 +880,24 @@ exports.completeUpload = async (req, res, next) => {
       await existingFile.save();
       await touchFolderHierarchy(cleanPath, touchedAt);
 
+      if (folderMetadata.orderId) {
+        void indexEmbeddingForCandidate({
+          externalId: folderMetadata.orderId,
+          filepath: cleanPath,
+          fileName,
+          contentType: fileContentType,
+          providerTimeoutMs: toPositiveInteger(req.body.providerTimeoutMs, FACE_SCAN_PROVIDER_TIMEOUT_MS),
+        }).then((indexResult) => {
+          if (indexResult?.status === "failed") {
+            console.warn("[face-index] upload-index-failed", {
+              externalId: folderMetadata.orderId,
+              filepath: cleanPath,
+              reason: indexResult?.reason || "unknown",
+            });
+          }
+        });
+      }
+
       return res.status(httpStatus.OK).json({
         success: true,
         message: "File metadata updated",
@@ -558,6 +930,24 @@ exports.completeUpload = async (req, res, next) => {
 
     await touchFolderHierarchy(cleanPath, touchedAt);
 
+    if (folderMetadata.orderId) {
+      void indexEmbeddingForCandidate({
+        externalId: folderMetadata.orderId,
+        filepath: cleanPath,
+        fileName,
+        contentType: fileContentType,
+        providerTimeoutMs: toPositiveInteger(req.body.providerTimeoutMs, FACE_SCAN_PROVIDER_TIMEOUT_MS),
+      }).then((indexResult) => {
+        if (indexResult?.status === "failed") {
+          console.warn("[face-index] upload-index-failed", {
+            externalId: folderMetadata.orderId,
+            filepath: cleanPath,
+            reason: indexResult?.reason || "unknown",
+          });
+        }
+      });
+    }
+
     return res.status(httpStatus.CREATED).json({
       success: true,
       message: "File metadata created",
@@ -567,6 +957,171 @@ exports.completeUpload = async (req, res, next) => {
         name: fileDoc.name,
         size: fileDoc.size,
       },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.searchFaceMatches = async (req, res, next) => {
+  try {
+    const externalId = normalizeExternalId(req.body.externalId || req.body.eventExternalId);
+    const scanImageBase64 = String(req.body.scanImageBase64 || "").trim();
+    const scanImageUrl = String(req.body.scanImageUrl || "").trim();
+    const threshold = Math.max(0, Math.min(1, Number(req.body.threshold || 0.7)));
+    const maxResults = toPositiveInteger(req.body.maxResults, 200);
+    const providerTimeoutMs = toPositiveInteger(
+      req.body.providerTimeoutMs,
+      FACE_SCAN_PROVIDER_TIMEOUT_MS
+    );
+
+    if (!externalId) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "externalId is required",
+      });
+    }
+
+    if (!scanImageBase64 && !scanImageUrl) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "scanImageBase64 or scanImageUrl is required",
+      });
+    }
+
+    const allCandidates = await listWorkspaceImageCandidates(externalId);
+    const indexedRows = await FaceEmbedding.find({
+      externalId,
+      status: "ready",
+    })
+      .select("filepath fileName embeddings facesCount")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    const indexedMatches = [];
+    const indexedPathSet = new Set(indexedRows.map((row) => String(row.filepath || "").trim()).filter(Boolean));
+
+    if (indexedRows.length) {
+      const queryEmbeddings = await fetchEmbeddingsForImage({
+        scanImageBase64,
+        scanImageUrl,
+        providerTimeoutMs,
+      });
+
+      indexedRows.forEach((row) => {
+        const candidateEmbeddings = Array.isArray(row.embeddings) ? row.embeddings : [];
+        if (!candidateEmbeddings.length) return;
+        const { score, queryFaceIndex, candidateFaceIndex } = getBestFacePairScore(
+          queryEmbeddings,
+          candidateEmbeddings
+        );
+        if (score < threshold) return;
+        indexedMatches.push({
+          path: row.filepath,
+          name: row.fileName || "",
+          score,
+          confidence: score,
+          queryFaceIndex,
+          candidateFaceIndex,
+          queryFacesDetected: queryEmbeddings.length,
+          candidateFacesDetected: candidateEmbeddings.length,
+        });
+      });
+    }
+
+    const hasIndexedData = indexedRows.length > 0;
+    const liveCandidates = hasIndexedData
+      ? allCandidates.filter((candidate) => !indexedPathSet.has(String(candidate.path || "").trim()))
+      : allCandidates;
+
+    const liveCandidateLimit = hasIndexedData
+      ? toPositiveInteger(req.body.fallbackCandidateLimit, FACE_SCAN_FALLBACK_MAX_CANDIDATES)
+      : toPositiveInteger(req.body.candidateLimit, FACE_SCAN_MAX_CANDIDATES);
+
+    const liveSearchResult = await runProviderFaceSearch({
+      externalId,
+      scanImageBase64,
+      scanImageUrl,
+      threshold,
+      maxResults,
+      providerTimeoutMs,
+      candidates: liveCandidates.slice(0, liveCandidateLimit),
+    });
+
+    const mergedMatches = mergeFaceMatchesByBestScore([
+      ...indexedMatches,
+      ...(liveSearchResult.matches || []),
+    ]).slice(0, maxResults);
+    const scanMode = hasIndexedData ? "indexed_plus_fallback_scan" : "full_face_scan";
+    const provider = hasIndexedData
+      ? `deepface-indexed+${liveSearchResult.provider || "deepface"}`
+      : liveSearchResult.provider || "deepface";
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      message: "Face scan completed",
+      data: {
+        externalId,
+        scanMode,
+        integrated: true,
+        candidatesCount: allCandidates.length,
+        indexedCandidatesCount: indexedRows.length,
+        scannedCandidatesCount: (hasIndexedData ? indexedRows.length : 0) + liveSearchResult.scannedCandidatesCount,
+        matches: mergedMatches,
+        provider,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.reindexFaceEmbeddings = async (req, res, next) => {
+  try {
+    const externalId = normalizeExternalId(req.body.externalId || req.body.eventExternalId);
+    if (!externalId) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "externalId is required",
+      });
+    }
+
+    const candidateLimit = toPositiveInteger(req.body.candidateLimit, 2000);
+    const concurrency = toPositiveInteger(req.body.concurrency, FACE_SCAN_INDEX_CONCURRENCY);
+    const providerTimeoutMs = toPositiveInteger(
+      req.body.providerTimeoutMs,
+      FACE_SCAN_PROVIDER_TIMEOUT_MS
+    );
+
+    const allCandidates = await listWorkspaceImageCandidates(externalId);
+    const selectedCandidates = allCandidates.slice(0, candidateLimit);
+
+    const summary = {
+      externalId,
+      totalCandidates: allCandidates.length,
+      selectedCandidates: selectedCandidates.length,
+      indexed: 0,
+      skipped: 0,
+      failed: 0,
+    };
+
+    await runWithConcurrency(selectedCandidates, concurrency, async (candidate) => {
+      const result = await indexEmbeddingForCandidate({
+        externalId,
+        filepath: candidate.path,
+        fileName: candidate.name,
+        contentType: candidate.contentType,
+        providerTimeoutMs,
+      });
+      if (result.status === "indexed") summary.indexed += 1;
+      else if (result.status === "failed") summary.failed += 1;
+      else summary.skipped += 1;
+    });
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      message: "Face embedding reindex completed",
+      data: summary,
     });
   } catch (error) {
     return next(error);
@@ -710,12 +1265,16 @@ exports.deleteEntry = async (req, res, next) => {
     }
 
     const metadataCleanup = await FileMeta.deleteMany(extraDeleteFilter);
+    const embeddingCleanup = await FaceEmbedding.deleteMany({
+      $or: [{ filepath: pathWithoutSlash }, { filepath: pathWithSlash }, { filepath: pathRegex }],
+    });
 
     return res.status(httpStatus.OK).json({
       success: true,
       data: {
         ...result,
         metadataDeletedCount: metadataCleanup.deletedCount || 0,
+        embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
       },
     });
   } catch (error) {

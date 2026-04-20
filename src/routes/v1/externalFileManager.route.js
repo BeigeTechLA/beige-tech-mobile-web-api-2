@@ -26,6 +26,8 @@ router.get("/workspace/:externalId/files", externalFileManagerController.getWork
 router.post("/folder", externalFileManagerController.createFolder);
 router.post("/upload-policy", externalFileManagerController.getUploadPolicy);
 router.post("/file-uploaded", externalFileManagerController.completeUpload);
+router.post("/face-scan/search", externalFileManagerController.searchFaceMatches);
+router.post("/face-scan/reindex", externalFileManagerController.reindexFaceEmbeddings);
 router.post("/file-view-url", externalFileManagerController.getFileViewUrl);
 router.post("/file-download-url", externalFileManagerController.getFileDownloadUrl);
 router.post("/folder-download-url", externalFileManagerController.getFolderDownloadUrl);
