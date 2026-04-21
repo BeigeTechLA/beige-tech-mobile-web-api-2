@@ -14,6 +14,22 @@ const FACE_SCAN_FALLBACK_MAX_CANDIDATES = Math.max(
   Number(process.env.FACE_SCAN_FALLBACK_MAX_CANDIDATES || 400)
 );
 const FACE_SCAN_INDEX_CONCURRENCY = Math.max(1, Number(process.env.FACE_SCAN_INDEX_CONCURRENCY || 3));
+const FACE_SCAN_MAX_INDEX_RETRIES = Math.max(
+  1,
+  Number(process.env.FACE_SCAN_MAX_INDEX_RETRIES || 2)
+);
+const FACE_SCAN_READY_COVERAGE_THRESHOLD = Math.max(
+  0.5,
+  Math.min(1, Number(process.env.FACE_SCAN_READY_COVERAGE_THRESHOLD || 0.9))
+);
+const FACE_SCAN_BACKGROUND_REINDEX_BATCH = Math.max(
+  25,
+  Number(process.env.FACE_SCAN_BACKGROUND_REINDEX_BATCH || 250)
+);
+const FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY || 2)
+);
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
@@ -129,6 +145,15 @@ const fetchFaceServicePayload = async (path, payload = {}, timeoutMs = FACE_SCAN
   } finally {
     clearTimeout(timeout);
   }
+};
+
+const isNoFaceDetectedError = (error) => {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("face could not be detected") ||
+    message.includes("no face detected") ||
+    message.includes("failed to process scan image")
+  );
 };
 
 const encodePathForUrl = (value) =>
@@ -388,6 +413,8 @@ const upsertFaceEmbedding = async ({
   embeddings = [],
   status = "ready",
   errorMessage = null,
+  errorCode = null,
+  retryCount = 0,
 }) => {
   const normalizedExternalId = normalizeExternalId(externalId);
   const normalizedPath = normalizeWorkspacePath(filepath);
@@ -405,6 +432,8 @@ const upsertFaceEmbedding = async ({
         facesCount: Array.isArray(embeddings) ? embeddings.length : 0,
         status,
         errorMessage: errorMessage ? String(errorMessage).slice(0, 255) : null,
+        errorCode: errorCode ? String(errorCode).slice(0, 64) : null,
+        retryCount: Math.max(0, Number(retryCount || 0)),
         indexedAt: new Date(),
       },
     },
@@ -429,19 +458,47 @@ const indexEmbeddingForCandidate = async ({
     return { status: "skipped", reason: "not_image_or_invalid" };
   }
 
+  let existingRetryCount = 0;
   try {
+    const existing = await FaceEmbedding.findOne({ filepath: normalizedPath })
+      .select("status retryCount")
+      .lean();
+    const existingStatus = String(existing?.status || "");
+    existingRetryCount = Math.max(0, Number(existing?.retryCount || 0));
+
+    if (existingStatus === "skipped") {
+      return { status: "skipped", reason: "final_skipped" };
+    }
+
+    if (!existing || existingStatus !== "ready") {
+      await upsertFaceEmbedding({
+        externalId,
+        filepath: normalizedPath,
+        fileName,
+        contentType,
+        status: "indexing",
+        errorMessage: null,
+        errorCode: null,
+        retryCount: existingRetryCount,
+      });
+    }
+
     const scanImageUrl = await getFileSignedViewUrl(normalizedPath);
     if (!scanImageUrl) {
+      const nextRetryCount = existingRetryCount + 1;
+      const status = nextRetryCount >= FACE_SCAN_MAX_INDEX_RETRIES ? "skipped" : "failed";
       await upsertFaceEmbedding({
         externalId,
         filepath: normalizedPath,
         fileName,
         contentType,
         embeddings: [],
-        status: "failed",
+        status,
         errorMessage: "Missing file view URL",
+        errorCode: "missing_view_url",
+        retryCount: nextRetryCount,
       });
-      return { status: "failed", reason: "missing_view_url" };
+      return { status, reason: "missing_view_url" };
     }
 
     const embeddings = await fetchEmbeddingsForImage({ scanImageUrl, providerTimeoutMs });
@@ -452,10 +509,12 @@ const indexEmbeddingForCandidate = async ({
         fileName,
         contentType,
         embeddings: [],
-        status: "failed",
+        status: "skipped",
         errorMessage: "No face detected",
+        errorCode: "no_face",
+        retryCount: existingRetryCount,
       });
-      return { status: "failed", reason: "no_face" };
+      return { status: "skipped", reason: "no_face" };
     }
 
     await upsertFaceEmbedding({
@@ -466,21 +525,134 @@ const indexEmbeddingForCandidate = async ({
       embeddings,
       status: "ready",
       errorMessage: null,
+      errorCode: null,
+      retryCount: 0,
     });
 
     return { status: "indexed", facesCount: embeddings.length };
   } catch (error) {
+    const nextRetryCount = existingRetryCount + 1;
+    const shouldFinalize = nextRetryCount >= FACE_SCAN_MAX_INDEX_RETRIES;
+    const status = shouldFinalize ? "skipped" : "failed";
+
     await upsertFaceEmbedding({
       externalId,
       filepath: normalizedPath,
       fileName,
       contentType,
       embeddings: [],
-      status: "failed",
+      status,
       errorMessage: error?.message || "Face indexing failed",
+      errorCode: Number(error?.status || 0) === 400 ? "provider_bad_request" : "provider_error",
+      retryCount: nextRetryCount,
     });
-    return { status: "failed", reason: error?.message || "Face indexing failed" };
+    return { status, reason: error?.message || "Face indexing failed" };
   }
+};
+
+const scheduleBackgroundReindex = ({
+  externalId,
+  candidates = [],
+  candidateLimit = FACE_SCAN_BACKGROUND_REINDEX_BATCH,
+  concurrency = FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY,
+  providerTimeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS,
+}) => {
+  const selected = (Array.isArray(candidates) ? candidates : []).slice(
+    0,
+    toPositiveInteger(candidateLimit, FACE_SCAN_BACKGROUND_REINDEX_BATCH)
+  );
+  if (!selected.length) return 0;
+
+  void runWithConcurrency(selected, concurrency, async (candidate) => {
+    await indexEmbeddingForCandidate({
+      externalId,
+      filepath: candidate.path,
+      fileName: candidate.name,
+      contentType: candidate.contentType,
+      providerTimeoutMs,
+    });
+  }).catch((error) => {
+    console.warn("[face-index] background-reindex-failed", {
+      externalId,
+      reason: error?.message || "unknown",
+    });
+  });
+
+  return selected.length;
+};
+
+const getWorkspaceFaceIndexSummary = async (externalId, candidates = null) => {
+  const normalizedExternalId = normalizeExternalId(externalId);
+  if (!normalizedExternalId) {
+    return {
+      state: "not_indexed",
+      totalCandidates: 0,
+      readyCandidates: 0,
+      skippedCandidates: 0,
+      indexingCandidates: 0,
+      failedCandidates: 0,
+      pendingCandidates: 0,
+      coverage: 0,
+    };
+  }
+
+  const workspaceCandidates = Array.isArray(candidates)
+    ? candidates
+    : await listWorkspaceImageCandidates(normalizedExternalId);
+  const candidatePathSet = new Set(
+    workspaceCandidates
+      .map((candidate) => normalizeWorkspacePath(candidate?.path))
+      .filter(Boolean)
+  );
+
+  const rows = await FaceEmbedding.find({
+    externalId: normalizedExternalId,
+    filepath: { $in: Array.from(candidatePathSet) },
+  })
+    .select("filepath status retryCount")
+    .lean();
+
+  let readyCandidates = 0;
+  let skippedCandidates = 0;
+  let failedCandidates = 0;
+  let indexingCandidates = 0;
+
+  rows.forEach((row) => {
+    const status = String(row?.status || "");
+    const retryCount = Math.max(0, Number(row?.retryCount || 0));
+    if (status === "ready") readyCandidates += 1;
+    else if (status === "skipped") skippedCandidates += 1;
+    else if (status === "failed" && retryCount >= FACE_SCAN_MAX_INDEX_RETRIES) skippedCandidates += 1;
+    else if (status === "failed") failedCandidates += 1;
+    else if (status === "indexing") indexingCandidates += 1;
+  });
+
+  const totalCandidates = candidatePathSet.size;
+  const pendingCandidates = Math.max(
+    0,
+    totalCandidates - readyCandidates - indexingCandidates - skippedCandidates - failedCandidates
+  );
+  const effectiveReadyCandidates = readyCandidates + skippedCandidates;
+  const coverage = totalCandidates
+    ? Number((effectiveReadyCandidates / totalCandidates).toFixed(4))
+    : 0;
+
+  let state = "not_indexed";
+  if (!totalCandidates) state = "empty";
+  else if (coverage >= FACE_SCAN_READY_COVERAGE_THRESHOLD) state = "ready";
+  else if (indexingCandidates > 0) state = "indexing";
+  else if (effectiveReadyCandidates > 0 || failedCandidates > 0) state = "partial";
+
+  return {
+    state,
+    totalCandidates,
+    readyCandidates,
+    skippedCandidates,
+    indexingCandidates,
+    failedCandidates,
+    pendingCandidates,
+    coverage,
+  };
 };
 
 const mergeFaceMatchesByBestScore = (matches = []) => {
@@ -970,6 +1142,7 @@ exports.searchFaceMatches = async (req, res, next) => {
     const scanImageUrl = String(req.body.scanImageUrl || "").trim();
     const threshold = Math.max(0, Math.min(1, Number(req.body.threshold || 0.7)));
     const maxResults = toPositiveInteger(req.body.maxResults, 200);
+    const minScore = Math.max(0, Math.min(1, Number(req.body.minScore ?? threshold)));
     const providerTimeoutMs = toPositiveInteger(
       req.body.providerTimeoutMs,
       FACE_SCAN_PROVIDER_TIMEOUT_MS
@@ -990,6 +1163,9 @@ exports.searchFaceMatches = async (req, res, next) => {
     }
 
     const allCandidates = await listWorkspaceImageCandidates(externalId);
+    const candidatePathSet = new Set(
+      allCandidates.map((candidate) => normalizeWorkspacePath(candidate?.path)).filter(Boolean)
+    );
     const indexedRows = await FaceEmbedding.find({
       externalId,
       status: "ready",
@@ -997,65 +1173,135 @@ exports.searchFaceMatches = async (req, res, next) => {
       .select("filepath fileName embeddings facesCount")
       .sort({ updatedAt: -1 })
       .lean();
+    const indexedRowsInWorkspace = indexedRows.filter((row) =>
+      candidatePathSet.has(normalizeWorkspacePath(row?.filepath))
+    );
 
     const indexedMatches = [];
-    const indexedPathSet = new Set(indexedRows.map((row) => String(row.filepath || "").trim()).filter(Boolean));
+    const indexedPathSet = new Set(
+      indexedRowsInWorkspace.map((row) => String(row.filepath || "").trim()).filter(Boolean)
+    );
+    const nonReadyRows = await FaceEmbedding.find({
+      externalId,
+      filepath: { $in: Array.from(candidatePathSet) },
+      status: { $in: ["failed", "skipped"] },
+    })
+      .select("filepath status retryCount errorCode")
+      .lean();
+    const blockedLivePathSet = new Set(
+      nonReadyRows
+        .filter((row) => {
+          const status = String(row?.status || "");
+          const errorCode = String(row?.errorCode || "").toLowerCase();
+          if (status === "skipped") {
+            return errorCode === "no_face" || errorCode === "not_image_or_invalid";
+          }
+          return false;
+        })
+        .map((row) => String(row?.filepath || "").trim())
+        .filter(Boolean)
+    );
 
-    if (indexedRows.length) {
-      const queryEmbeddings = await fetchEmbeddingsForImage({
-        scanImageBase64,
-        scanImageUrl,
-        providerTimeoutMs,
-      });
-
-      indexedRows.forEach((row) => {
-        const candidateEmbeddings = Array.isArray(row.embeddings) ? row.embeddings : [];
-        if (!candidateEmbeddings.length) return;
-        const { score, queryFaceIndex, candidateFaceIndex } = getBestFacePairScore(
-          queryEmbeddings,
-          candidateEmbeddings
-        );
-        if (score < threshold) return;
-        indexedMatches.push({
-          path: row.filepath,
-          name: row.fileName || "",
-          score,
-          confidence: score,
-          queryFaceIndex,
-          candidateFaceIndex,
-          queryFacesDetected: queryEmbeddings.length,
-          candidateFacesDetected: candidateEmbeddings.length,
+    if (indexedRowsInWorkspace.length) {
+      try {
+        const queryEmbeddings = await fetchEmbeddingsForImage({
+          scanImageBase64,
+          scanImageUrl,
+          providerTimeoutMs,
         });
-      });
+
+        indexedRowsInWorkspace.forEach((row) => {
+          const candidateEmbeddings = Array.isArray(row.embeddings) ? row.embeddings : [];
+          if (!candidateEmbeddings.length) return;
+          const { score, queryFaceIndex, candidateFaceIndex } = getBestFacePairScore(
+            queryEmbeddings,
+            candidateEmbeddings
+          );
+          if (score < threshold) return;
+          indexedMatches.push({
+            path: row.filepath,
+            name: row.fileName || "",
+            score,
+            confidence: score,
+            queryFaceIndex,
+            candidateFaceIndex,
+            queryFacesDetected: queryEmbeddings.length,
+            candidateFacesDetected: candidateEmbeddings.length,
+          });
+        });
+      } catch (error) {
+        if (isNoFaceDetectedError(error)) {
+          // We'll still try live scan branch below, and if provider also returns no-face we respond gracefully.
+        } else {
+          throw error;
+        }
+      }
     }
 
-    const hasIndexedData = indexedRows.length > 0;
-    const liveCandidates = hasIndexedData
+    const hasIndexedData = indexedRowsInWorkspace.length > 0;
+    const liveCandidatesBase = hasIndexedData
       ? allCandidates.filter((candidate) => !indexedPathSet.has(String(candidate.path || "").trim()))
       : allCandidates;
+    const liveCandidates = liveCandidatesBase.filter(
+      (candidate) => !blockedLivePathSet.has(String(candidate.path || "").trim())
+    );
 
     const liveCandidateLimit = hasIndexedData
       ? toPositiveInteger(req.body.fallbackCandidateLimit, FACE_SCAN_FALLBACK_MAX_CANDIDATES)
       : toPositiveInteger(req.body.candidateLimit, FACE_SCAN_MAX_CANDIDATES);
 
-    const liveSearchResult = await runProviderFaceSearch({
-      externalId,
-      scanImageBase64,
-      scanImageUrl,
-      threshold,
-      maxResults,
-      providerTimeoutMs,
-      candidates: liveCandidates.slice(0, liveCandidateLimit),
-    });
+    const backgroundReindexEnabled = req.body.backgroundReindex !== false;
+    const queuedForBackgroundIndex = backgroundReindexEnabled
+      ? scheduleBackgroundReindex({
+          externalId,
+          candidates: liveCandidates,
+          candidateLimit: toPositiveInteger(
+            req.body.backgroundBatchLimit,
+            FACE_SCAN_BACKGROUND_REINDEX_BATCH
+          ),
+          concurrency: toPositiveInteger(
+            req.body.backgroundConcurrency,
+            FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY
+          ),
+          providerTimeoutMs,
+        })
+      : 0;
+
+    let liveSearchResult = {
+      scannedCandidatesCount: 0,
+      matches: [],
+      provider: "deepface",
+    };
+    let noFaceDetectedInScanImage = false;
+    try {
+      liveSearchResult = await runProviderFaceSearch({
+        externalId,
+        scanImageBase64,
+        scanImageUrl,
+        threshold,
+        maxResults,
+        providerTimeoutMs,
+        candidates: liveCandidates.slice(0, liveCandidateLimit),
+      });
+    } catch (error) {
+      if (isNoFaceDetectedError(error)) {
+        noFaceDetectedInScanImage = true;
+      } else {
+        throw error;
+      }
+    }
 
     const mergedMatches = mergeFaceMatchesByBestScore([
       ...indexedMatches,
       ...(liveSearchResult.matches || []),
-    ]).slice(0, maxResults);
+    ])
+      .filter((item) => Number(item?.score || item?.confidence || 0) >= minScore)
+      .slice(0, maxResults);
     const scanMode = hasIndexedData ? "indexed_plus_fallback_scan" : "full_face_scan";
     const provider = hasIndexedData
       ? `deepface-indexed+${liveSearchResult.provider || "deepface"}`
       : liveSearchResult.provider || "deepface";
+    const workspaceIndexStatus = await getWorkspaceFaceIndexSummary(externalId, allCandidates);
 
     return res.status(httpStatus.OK).json({
       success: true,
@@ -1065,10 +1311,45 @@ exports.searchFaceMatches = async (req, res, next) => {
         scanMode,
         integrated: true,
         candidatesCount: allCandidates.length,
-        indexedCandidatesCount: indexedRows.length,
-        scannedCandidatesCount: (hasIndexedData ? indexedRows.length : 0) + liveSearchResult.scannedCandidatesCount,
+        indexedCandidatesCount: indexedRowsInWorkspace.length,
+        scannedCandidatesCount:
+          (hasIndexedData ? indexedRowsInWorkspace.length : 0) +
+          liveSearchResult.scannedCandidatesCount,
+        backgroundIndexQueued: queuedForBackgroundIndex,
+        noFaceDetectedInScanImage,
+        minScore,
+        indexStatus: workspaceIndexStatus,
         matches: mergedMatches,
         provider,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.getFaceScanIndexStatus = async (req, res, next) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const externalId = normalizeExternalId(
+      req.params.externalId || req.query.externalId || body.externalId || body.eventExternalId
+    );
+    if (!externalId) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "externalId is required",
+      });
+    }
+
+    const candidates = await listWorkspaceImageCandidates(externalId);
+    const summary = await getWorkspaceFaceIndexSummary(externalId, candidates);
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      message: "Face index status fetched",
+      data: {
+        externalId,
+        ...summary,
       },
     });
   } catch (error) {

@@ -34,13 +34,22 @@ const faceEmbeddingSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["ready", "failed"],
+      enum: ["ready", "indexing", "failed", "skipped"],
       default: "ready",
       index: true,
     },
     errorMessage: {
       type: String,
       default: null,
+    },
+    errorCode: {
+      type: String,
+      default: null,
+    },
+    retryCount: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
     indexedAt: {
       type: Date,
