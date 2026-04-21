@@ -8,12 +8,24 @@ const FACE_SCAN_PROVIDER_TIMEOUT_MS = Math.max(
   15000,
   Number(process.env.FACE_SCAN_PROVIDER_TIMEOUT_MS || 3000000)
 );
+const FACE_SCAN_PROVIDER_TIMEOUT_MAX_MS = Math.max(
+  FACE_SCAN_PROVIDER_TIMEOUT_MS,
+  Number(process.env.FACE_SCAN_PROVIDER_TIMEOUT_MAX_MS || 3000000)
+);
 const FACE_SCAN_MAX_CANDIDATES = Math.max(25, Number(process.env.FACE_SCAN_MAX_CANDIDATES || 80));
 const FACE_SCAN_FALLBACK_MAX_CANDIDATES = Math.max(
   50,
-  Number(process.env.FACE_SCAN_FALLBACK_MAX_CANDIDATES || 400)
+  Number(process.env.FACE_SCAN_FALLBACK_MAX_CANDIDATES || 120)
+);
+const FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX = Math.max(
+  FACE_SCAN_MAX_CANDIDATES,
+  Number(process.env.FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX || 100)
 );
 const FACE_SCAN_INDEX_CONCURRENCY = Math.max(1, Number(process.env.FACE_SCAN_INDEX_CONCURRENCY || 3));
+const FACE_SCAN_REINDEX_CANDIDATE_LIMIT_MAX = Math.max(
+  100,
+  Number(process.env.FACE_SCAN_REINDEX_CANDIDATE_LIMIT_MAX || 1200)
+);
 const FACE_SCAN_MAX_INDEX_RETRIES = Math.max(
   1,
   Number(process.env.FACE_SCAN_MAX_INDEX_RETRIES || 2)
@@ -49,6 +61,11 @@ const toPositiveInteger = (value, fallback) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, Math.floor(parsed));
+};
+
+const resolveProviderTimeoutMs = (value, fallback = FACE_SCAN_PROVIDER_TIMEOUT_MS) => {
+  const resolved = toPositiveInteger(value, fallback);
+  return Math.max(15000, Math.min(resolved, FACE_SCAN_PROVIDER_TIMEOUT_MAX_MS));
 };
 
 const runWithConcurrency = async (items = [], concurrency = 3, task = async () => null) => {
@@ -1053,13 +1070,13 @@ exports.completeUpload = async (req, res, next) => {
       await touchFolderHierarchy(cleanPath, touchedAt);
 
       if (folderMetadata.orderId) {
-        void indexEmbeddingForCandidate({
-          externalId: folderMetadata.orderId,
-          filepath: cleanPath,
-          fileName,
-          contentType: fileContentType,
-          providerTimeoutMs: toPositiveInteger(req.body.providerTimeoutMs, FACE_SCAN_PROVIDER_TIMEOUT_MS),
-        }).then((indexResult) => {
+          void indexEmbeddingForCandidate({
+            externalId: folderMetadata.orderId,
+            filepath: cleanPath,
+            fileName,
+            contentType: fileContentType,
+            providerTimeoutMs: resolveProviderTimeoutMs(req.body.providerTimeoutMs),
+          }).then((indexResult) => {
           if (indexResult?.status === "failed") {
             console.warn("[face-index] upload-index-failed", {
               externalId: folderMetadata.orderId,
@@ -1108,7 +1125,7 @@ exports.completeUpload = async (req, res, next) => {
         filepath: cleanPath,
         fileName,
         contentType: fileContentType,
-        providerTimeoutMs: toPositiveInteger(req.body.providerTimeoutMs, FACE_SCAN_PROVIDER_TIMEOUT_MS),
+        providerTimeoutMs: resolveProviderTimeoutMs(req.body.providerTimeoutMs),
       }).then((indexResult) => {
         if (indexResult?.status === "failed") {
           console.warn("[face-index] upload-index-failed", {
@@ -1143,10 +1160,7 @@ exports.searchFaceMatches = async (req, res, next) => {
     const threshold = Math.max(0, Math.min(1, Number(req.body.threshold || 0.7)));
     const maxResults = toPositiveInteger(req.body.maxResults, 200);
     const minScore = Math.max(0, Math.min(1, Number(req.body.minScore ?? threshold)));
-    const providerTimeoutMs = toPositiveInteger(
-      req.body.providerTimeoutMs,
-      FACE_SCAN_PROVIDER_TIMEOUT_MS
-    );
+    const providerTimeoutMs = resolveProviderTimeoutMs(req.body.providerTimeoutMs);
 
     if (!externalId) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -1246,9 +1260,10 @@ exports.searchFaceMatches = async (req, res, next) => {
       (candidate) => !blockedLivePathSet.has(String(candidate.path || "").trim())
     );
 
-    const liveCandidateLimit = hasIndexedData
+    const requestedLiveCandidateLimit = hasIndexedData
       ? toPositiveInteger(req.body.fallbackCandidateLimit, FACE_SCAN_FALLBACK_MAX_CANDIDATES)
       : toPositiveInteger(req.body.candidateLimit, FACE_SCAN_MAX_CANDIDATES);
+    const liveCandidateLimit = Math.min(requestedLiveCandidateLimit, FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX);
 
     const backgroundReindexEnabled = req.body.backgroundReindex !== false;
     const queuedForBackgroundIndex = backgroundReindexEnabled
@@ -1272,22 +1287,26 @@ exports.searchFaceMatches = async (req, res, next) => {
       matches: [],
       provider: "deepface",
     };
+    const hasIndexedMatches = indexedMatches.length > 0;
+    const shouldRunLiveFallback = req.body.includeLiveFallback === true || !hasIndexedMatches;
     let noFaceDetectedInScanImage = false;
-    try {
-      liveSearchResult = await runProviderFaceSearch({
-        externalId,
-        scanImageBase64,
-        scanImageUrl,
-        threshold,
-        maxResults,
-        providerTimeoutMs,
-        candidates: liveCandidates.slice(0, liveCandidateLimit),
-      });
-    } catch (error) {
-      if (isNoFaceDetectedError(error)) {
-        noFaceDetectedInScanImage = true;
-      } else {
-        throw error;
+    if (shouldRunLiveFallback) {
+      try {
+        liveSearchResult = await runProviderFaceSearch({
+          externalId,
+          scanImageBase64,
+          scanImageUrl,
+          threshold,
+          maxResults,
+          providerTimeoutMs,
+          candidates: liveCandidates.slice(0, liveCandidateLimit),
+        });
+      } catch (error) {
+        if (isNoFaceDetectedError(error)) {
+          noFaceDetectedInScanImage = true;
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -1315,6 +1334,7 @@ exports.searchFaceMatches = async (req, res, next) => {
         scannedCandidatesCount:
           (hasIndexedData ? indexedRowsInWorkspace.length : 0) +
           liveSearchResult.scannedCandidatesCount,
+        liveFallbackTriggered: shouldRunLiveFallback,
         backgroundIndexQueued: queuedForBackgroundIndex,
         noFaceDetectedInScanImage,
         minScore,
@@ -1367,15 +1387,40 @@ exports.reindexFaceEmbeddings = async (req, res, next) => {
       });
     }
 
-    const candidateLimit = toPositiveInteger(req.body.candidateLimit, 2000);
-    const concurrency = toPositiveInteger(req.body.concurrency, FACE_SCAN_INDEX_CONCURRENCY);
-    const providerTimeoutMs = toPositiveInteger(
-      req.body.providerTimeoutMs,
-      FACE_SCAN_PROVIDER_TIMEOUT_MS
+    const candidateLimit = Math.min(
+      toPositiveInteger(req.body.candidateLimit, 2000),
+      FACE_SCAN_REINDEX_CANDIDATE_LIMIT_MAX
     );
+    const concurrency = toPositiveInteger(req.body.concurrency, FACE_SCAN_INDEX_CONCURRENCY);
+    const providerTimeoutMs = resolveProviderTimeoutMs(req.body.providerTimeoutMs);
 
     const allCandidates = await listWorkspaceImageCandidates(externalId);
     const selectedCandidates = allCandidates.slice(0, candidateLimit);
+    const runInBackground = req.body.sync !== true;
+
+    if (runInBackground) {
+      const queued = scheduleBackgroundReindex({
+        externalId,
+        candidates: selectedCandidates,
+        candidateLimit: selectedCandidates.length,
+        concurrency,
+        providerTimeoutMs,
+      });
+      const indexStatus = await getWorkspaceFaceIndexSummary(externalId, allCandidates);
+
+      return res.status(httpStatus.OK).json({
+        success: true,
+        message: "Face embedding reindex queued",
+        data: {
+          externalId,
+          mode: "background",
+          totalCandidates: allCandidates.length,
+          selectedCandidates: selectedCandidates.length,
+          queuedCandidates: queued,
+          indexStatus,
+        },
+      });
+    }
 
     const summary = {
       externalId,
