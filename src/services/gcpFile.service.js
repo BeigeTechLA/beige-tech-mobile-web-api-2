@@ -63,6 +63,11 @@ try {
 
 const CDN_URL = process.env.CDN_URL || null;
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || "*";
+const UPLOAD_FOLDER_METADATA_CACHE_TTL_MS = Math.max(
+  10000,
+  Number(process.env.UPLOAD_FOLDER_METADATA_CACHE_TTL_MS || 120000)
+);
+const uploadFolderMetadataCache = new Map();
 
 // let CDN_ADMINS = [process.env.CDN_ADMIN];
 let CDN_ADMINS = [config.GCP.cdnAdmins];
@@ -117,6 +122,46 @@ async function setBucketCors() {
   );
   CorsAlreadyChecked = true;
 }
+
+const getCachedFolderCreatedByUsers = async (folderPath = "") => {
+  if (!folderPath) return [];
+  const cacheKey = String(folderPath || "").toLowerCase();
+  const now = Date.now();
+  const cached = uploadFolderMetadataCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.userIds;
+  }
+
+  let userIds = [];
+  try {
+    const folder = bucket.file(folderPath);
+    const [exists] = await folder.exists();
+    if (exists) {
+      const [folderMetadata] = await folder.getMetadata();
+      const createdBy = folderMetadata?.metadata?.createdBy;
+
+      if (typeof createdBy === "string") {
+        try {
+          const parsed = JSON.parse(createdBy);
+          userIds = Array.isArray(parsed) ? parsed.map((id) => String(id)) : [String(createdBy)];
+        } catch (parseError) {
+          userIds = [String(createdBy)];
+        }
+      } else if (Array.isArray(createdBy)) {
+        userIds = createdBy.map((id) => String(id));
+      }
+    }
+  } catch (error) {
+    logger.warn(`Failed to load folder metadata cache for ${folderPath}: ${error.message}`);
+  }
+
+  const deduped = [...new Set(userIds.filter(Boolean))];
+  uploadFolderMetadataCache.set(cacheKey, {
+    userIds: deduped,
+    expiresAt: now + UPLOAD_FOLDER_METADATA_CACHE_TTL_MS,
+  });
+  return deduped;
+};
 
 const createFolder = async (
   folderName,
@@ -1135,41 +1180,13 @@ const uploadFile = async (
   // Initialize array of user IDs with the provided userId (if any)
   let userIds = userId ? [userId] : []; // Client Id added here
   
-  // If this file is in a folder, check the folder's metadata for createdBy users
+  // If this file is in a folder, read cached folder metadata for createdBy users
+  // to avoid repeated GCS metadata calls during large multi-file uploads.
   if (folderPath) {
     try {
-      const folder = bucket.file(folderPath);
-      const [exists] = await folder.exists();
-      
-      if (exists) {
-        const [folderMetadata] = await folder.getMetadata();
-        
-        if (folderMetadata.metadata && folderMetadata.metadata.createdBy) {
-          try {
-            let folderCreatedBy;
-            
-            // Handle different formats of createdBy metadata
-            if (typeof folderMetadata.metadata.createdBy === 'string') {
-              try {
-                // Try to parse as JSON
-                folderCreatedBy = JSON.parse(folderMetadata.metadata.createdBy);
-              } catch (parseError) {
-                // If parsing fails, treat as a single string ID
-                folderCreatedBy = [folderMetadata.metadata.createdBy];
-              }
-            } else if (Array.isArray(folderMetadata.metadata.createdBy)) {
-              // If it's already an array, use it directly
-              folderCreatedBy = folderMetadata.metadata.createdBy;
-            }
-            
-            // If we have valid folder users, merge them with our list
-            if (Array.isArray(folderCreatedBy)) {
-              userIds = [...new Set([...userIds, ...folderCreatedBy])];
-            }
-          } catch (e) {
-            console.error('Error processing folder createdBy metadata:', e);
-          }
-        }
+      const folderCreatedBy = await getCachedFolderCreatedByUsers(folderPath);
+      if (folderCreatedBy.length) {
+        userIds = [...new Set([...userIds, ...folderCreatedBy])];
       }
     } catch (e) {
       console.error('Error getting folder metadata:', e);

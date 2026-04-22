@@ -42,6 +42,21 @@ const FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY = Math.max(
   1,
   Number(process.env.FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY || 2)
 );
+const ENABLE_UPLOAD_FACE_INDEXING =
+  String(process.env.ENABLE_UPLOAD_FACE_INDEXING || "false").toLowerCase() === "true";
+const FACE_SCAN_UPLOAD_INDEX_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.FACE_SCAN_UPLOAD_INDEX_CONCURRENCY || 1)
+);
+const FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT = Math.max(
+  100,
+  Number(process.env.FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT || 5000)
+);
+const PARENT_FOLDER_CACHE_TTL_MS = Math.max(
+  5000,
+  Number(process.env.PARENT_FOLDER_CACHE_TTL_MS || 30000)
+);
+const parentFolderMetaCache = new Map();
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
@@ -305,9 +320,23 @@ const getParentFolderMetadata = async (cleanPath) => {
   }
 
   const folderPath = `${pathParts.slice(0, -1).join("/")}/`;
+  const cacheKey = folderPath.toLowerCase();
+  const now = Date.now();
+  const cached = parentFolderMetaCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return { parentFolder: cached.parentFolder };
+  }
+
   const parentFolder = await FileMeta.findOne({
     path: folderPath,
     isFolder: true,
+  })
+    .select("_id path userId metadata")
+    .lean();
+
+  parentFolderMetaCache.set(cacheKey, {
+    parentFolder: parentFolder || null,
+    expiresAt: now + PARENT_FOLDER_CACHE_TTL_MS,
   });
 
   return { parentFolder };
@@ -565,6 +594,53 @@ const indexEmbeddingForCandidate = async ({
     });
     return { status, reason: error?.message || "Face indexing failed" };
   }
+};
+
+const uploadFaceIndexQueue = [];
+let uploadFaceIndexActiveCount = 0;
+
+const processUploadFaceIndexQueue = () => {
+  if (!ENABLE_UPLOAD_FACE_INDEXING) return;
+
+  while (
+    uploadFaceIndexActiveCount < FACE_SCAN_UPLOAD_INDEX_CONCURRENCY &&
+    uploadFaceIndexQueue.length > 0
+  ) {
+    const job = uploadFaceIndexQueue.shift();
+    if (!job) break;
+    uploadFaceIndexActiveCount += 1;
+
+    void indexEmbeddingForCandidate(job)
+      .catch((error) => {
+        console.warn("[face-index] upload-index-queue-failed", {
+          externalId: job?.externalId,
+          filepath: job?.filepath,
+          reason: error?.message || "unknown",
+        });
+      })
+      .finally(() => {
+        uploadFaceIndexActiveCount = Math.max(0, uploadFaceIndexActiveCount - 1);
+        setImmediate(processUploadFaceIndexQueue);
+      });
+  }
+};
+
+const enqueueUploadFaceIndexJob = (job) => {
+  if (!ENABLE_UPLOAD_FACE_INDEXING) return;
+  if (!job?.externalId || !job?.filepath) return;
+
+  if (uploadFaceIndexQueue.length >= FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT) {
+    console.warn("[face-index] upload-index-queue-overflow", {
+      queueLength: uploadFaceIndexQueue.length,
+      limit: FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT,
+      externalId: job.externalId,
+      filepath: job.filepath,
+    });
+    return;
+  }
+
+  uploadFaceIndexQueue.push(job);
+  processUploadFaceIndexQueue();
 };
 
 const scheduleBackgroundReindex = ({
@@ -987,41 +1063,238 @@ exports.createFolder = async (req, res, next) => {
   }
 };
 
+const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId }) => {
+  const cleanPath = normalizeWorkspacePath(filepath);
+  const cleanContentType = String(fileContentType || "").trim();
+  const normalizedFileSize = Number(fileSize || 0);
+  const normalizedUserId = userId ? String(userId).trim() : null;
+
+  if (!cleanPath || !cleanContentType || !normalizedFileSize) {
+    return {
+      ok: false,
+      code: httpStatus.BAD_REQUEST,
+      error: "filepath, fileContentType and fileSize are required",
+      filepath: cleanPath || String(filepath || ""),
+    };
+  }
+
+  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  if (!parentFolder) {
+    return {
+      ok: false,
+      code: httpStatus.NOT_FOUND,
+      error: "Parent folder not found",
+      filepath: cleanPath,
+    };
+  }
+
+  const result = await gcpFileService.uploadFile(
+    `Website_Shoots_Flow/${cleanPath}`.replace(/\/+/g, "/"),
+    cleanContentType,
+    normalizedFileSize,
+    normalizedUserId,
+    {
+      orderId: parentFolder.metadata?.orderId || null,
+    }
+  );
+
+  return {
+    ok: true,
+    filepath: cleanPath,
+    data: result,
+  };
+};
+
+const completeUploadMetadataForFile = async ({
+  filepath,
+  fileContentType,
+  fileSize,
+  fileName,
+  userId,
+  authorName,
+  providerTimeoutMs,
+}) => {
+  const cleanPath = normalizeWorkspacePath(filepath);
+  const cleanContentType = String(fileContentType || "application/octet-stream").trim();
+  const normalizedFileSize = Number(fileSize || 0);
+  const cleanFileName = String(fileName || cleanPath.split("/").pop() || "").trim();
+  const normalizedUserId = userId ? String(userId).trim() : null;
+  const cleanAuthorName = String(authorName || "Beige User").trim();
+  const mongoUserId = toMongoUserIdOrNull(normalizedUserId);
+
+  if (!cleanPath || !normalizedUserId) {
+    return {
+      ok: false,
+      code: httpStatus.BAD_REQUEST,
+      error: "filepath and userId are required",
+      filepath: cleanPath || String(filepath || ""),
+    };
+  }
+
+  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  const folderMetadata = {
+    cpIds: parentFolder?.metadata?.cpIds || [],
+    orderId: parentFolder?.metadata?.orderId || null,
+    externalUserId: normalizedUserId,
+  };
+
+  const touchedAt = new Date();
+  const existingFile = await FileMeta.findOne({ path: cleanPath });
+
+  if (existingFile) {
+    existingFile.size = normalizedFileSize;
+    existingFile.contentType = cleanContentType;
+    existingFile.updatedAt = touchedAt;
+    existingFile.metadata = {
+      ...existingFile.metadata,
+      cpIds: folderMetadata.cpIds,
+      orderId: folderMetadata.orderId,
+    };
+    if (!existingFile.author || existingFile.author === "Unknown") {
+      existingFile.author = cleanAuthorName;
+    }
+    await existingFile.save();
+    await touchFolderHierarchy(cleanPath, touchedAt);
+
+    enqueueUploadFaceIndexJob({
+      externalId: folderMetadata.orderId,
+      filepath: cleanPath,
+      fileName: cleanFileName,
+      contentType: cleanContentType,
+      providerTimeoutMs: resolveProviderTimeoutMs(providerTimeoutMs),
+    });
+
+    return {
+      ok: true,
+      created: false,
+      data: {
+        id: existingFile._id.toString(),
+        path: existingFile.path,
+        name: existingFile.name,
+        size: existingFile.size,
+      },
+    };
+  }
+
+  const fileDoc = await FileMeta.create({
+    path: cleanPath,
+    name: cleanFileName,
+    userId: mongoUserId,
+    isFolder: false,
+    contentType: cleanContentType,
+    size: normalizedFileSize,
+    isPublic: false,
+    author: cleanAuthorName,
+    fullPath: `Website_Shoots_Flow/${cleanPath}`,
+    metadata: {
+      cpIds: folderMetadata.cpIds,
+      orderId: folderMetadata.orderId,
+    },
+    createdAt: touchedAt,
+    updatedAt: touchedAt,
+  });
+
+  await touchFolderHierarchy(cleanPath, touchedAt);
+
+  enqueueUploadFaceIndexJob({
+    externalId: folderMetadata.orderId,
+    filepath: cleanPath,
+    fileName: cleanFileName,
+    contentType: cleanContentType,
+    providerTimeoutMs: resolveProviderTimeoutMs(providerTimeoutMs),
+  });
+
+  return {
+    ok: true,
+    created: true,
+    data: {
+      id: fileDoc._id.toString(),
+      path: fileDoc.path,
+      name: fileDoc.name,
+      size: fileDoc.size,
+    },
+  };
+};
+
 exports.getUploadPolicy = async (req, res, next) => {
   try {
-    const cleanPath = normalizeWorkspacePath(req.body.filepath);
-    const fileContentType = String(req.body.fileContentType || "").trim();
-    const fileSize = Number(req.body.fileSize || 0);
-    const userId = req.body.userId ? String(req.body.userId).trim() : null;
+    const result = await resolveUploadPolicyForFile({
+      filepath: req.body.filepath,
+      fileContentType: req.body.fileContentType,
+      fileSize: req.body.fileSize,
+      userId: req.body.userId,
+    });
 
-    if (!cleanPath || !fileContentType || !fileSize) {
-      return res.status(httpStatus.BAD_REQUEST).json({
+    if (!result.ok) {
+      return res.status(result.code).json({
         success: false,
-        message: "filepath, fileContentType and fileSize are required",
+        message: result.error,
       });
     }
-
-    const { parentFolder } = await getParentFolderMetadata(cleanPath);
-    if (!parentFolder) {
-      return res.status(httpStatus.NOT_FOUND).json({
-        success: false,
-        message: "Parent folder not found",
-      });
-    }
-
-    const result = await gcpFileService.uploadFile(
-      `Website_Shoots_Flow/${cleanPath}`.replace(/\/+/g, "/"),
-      fileContentType,
-      fileSize,
-      userId,
-      {
-        orderId: parentFolder.metadata?.orderId || null,
-      }
-    );
 
     return res.status(httpStatus.OK).json({
       success: true,
-      data: result,
+      data: result.data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.getUploadPoliciesBatch = async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!items.length) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "items array is required",
+      });
+    }
+
+    const limitedItems = items.slice(0, 500);
+    const results = [];
+
+    await runWithConcurrency(limitedItems, 5, async (item = {}) => {
+      try {
+        const resolved = await resolveUploadPolicyForFile({
+          filepath: item.filepath,
+          fileContentType: item.fileContentType,
+          fileSize: item.fileSize,
+          userId: item.userId || req.body.userId,
+        });
+
+        if (resolved.ok) {
+          results.push({
+            filepath: resolved.filepath,
+            success: true,
+            data: resolved.data,
+          });
+        } else {
+          results.push({
+            filepath: resolved.filepath || String(item.filepath || ""),
+            success: false,
+            error: resolved.error,
+            code: resolved.code,
+          });
+        }
+      } catch (error) {
+        results.push({
+          filepath: String(item.filepath || ""),
+          success: false,
+          error: error?.message || "Failed to create upload policy",
+          code: httpStatus.INTERNAL_SERVER_ERROR,
+        });
+      }
+    });
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        total: limitedItems.length,
+        successCount: results.filter((item) => item.success).length,
+        failureCount: results.filter((item) => !item.success).length,
+        items: results,
+      },
     });
   } catch (error) {
     return next(error);
@@ -1030,121 +1303,90 @@ exports.getUploadPolicy = async (req, res, next) => {
 
 exports.completeUpload = async (req, res, next) => {
   try {
-    const cleanPath = normalizeWorkspacePath(req.body.filepath);
-    const fileContentType = String(req.body.fileContentType || "application/octet-stream").trim();
-    const fileSize = Number(req.body.fileSize || 0);
-    const fileName = String(req.body.fileName || cleanPath.split("/").pop() || "").trim();
-    const userId = req.body.userId ? String(req.body.userId).trim() : null;
-    const authorName = String(req.body.authorName || "Beige User").trim();
-    const mongoUserId = toMongoUserIdOrNull(userId);
-
-    if (!cleanPath || !userId) {
-      return res.status(httpStatus.BAD_REQUEST).json({
-        success: false,
-        message: "filepath and userId are required",
-      });
-    }
-
-    const { parentFolder } = await getParentFolderMetadata(cleanPath);
-    const folderMetadata = {
-      cpIds: parentFolder?.metadata?.cpIds || [],
-      orderId: parentFolder?.metadata?.orderId || null,
-      externalUserId: userId || null,
-    };
-
-    const existingFile = await FileMeta.findOne({ path: cleanPath });
-    const touchedAt = new Date();
-    if (existingFile) {
-      existingFile.size = fileSize;
-      existingFile.contentType = fileContentType;
-      existingFile.updatedAt = touchedAt;
-      existingFile.metadata = {
-        ...existingFile.metadata,
-        cpIds: folderMetadata.cpIds,
-        orderId: folderMetadata.orderId,
-      };
-      if (!existingFile.author || existingFile.author === "Unknown") {
-        existingFile.author = authorName;
-      }
-      await existingFile.save();
-      await touchFolderHierarchy(cleanPath, touchedAt);
-
-      if (folderMetadata.orderId) {
-          void indexEmbeddingForCandidate({
-            externalId: folderMetadata.orderId,
-            filepath: cleanPath,
-            fileName,
-            contentType: fileContentType,
-            providerTimeoutMs: resolveProviderTimeoutMs(req.body.providerTimeoutMs),
-          }).then((indexResult) => {
-          if (indexResult?.status === "failed") {
-            console.warn("[face-index] upload-index-failed", {
-              externalId: folderMetadata.orderId,
-              filepath: cleanPath,
-              reason: indexResult?.reason || "unknown",
-            });
-          }
-        });
-      }
-
-      return res.status(httpStatus.OK).json({
-        success: true,
-        message: "File metadata updated",
-        data: {
-          id: existingFile._id.toString(),
-          path: existingFile.path,
-          name: existingFile.name,
-          size: existingFile.size,
-        },
-      });
-    }
-
-    const fileDoc = await FileMeta.create({
-      path: cleanPath,
-      name: fileName,
-      userId: mongoUserId,
-      isFolder: false,
-      contentType: fileContentType,
-      size: fileSize,
-      isPublic: false,
-      author: authorName,
-      fullPath: `Website_Shoots_Flow/${cleanPath}`,
-      metadata: {
-        cpIds: folderMetadata.cpIds,
-        orderId: folderMetadata.orderId,
-      },
-      createdAt: touchedAt,
-      updatedAt: touchedAt,
+    const result = await completeUploadMetadataForFile({
+      filepath: req.body.filepath,
+      fileContentType: req.body.fileContentType,
+      fileSize: req.body.fileSize,
+      fileName: req.body.fileName,
+      userId: req.body.userId,
+      authorName: req.body.authorName,
+      providerTimeoutMs: req.body.providerTimeoutMs,
     });
 
-    await touchFolderHierarchy(cleanPath, touchedAt);
-
-    if (folderMetadata.orderId) {
-      void indexEmbeddingForCandidate({
-        externalId: folderMetadata.orderId,
-        filepath: cleanPath,
-        fileName,
-        contentType: fileContentType,
-        providerTimeoutMs: resolveProviderTimeoutMs(req.body.providerTimeoutMs),
-      }).then((indexResult) => {
-        if (indexResult?.status === "failed") {
-          console.warn("[face-index] upload-index-failed", {
-            externalId: folderMetadata.orderId,
-            filepath: cleanPath,
-            reason: indexResult?.reason || "unknown",
-          });
-        }
+    if (!result.ok) {
+      return res.status(result.code).json({
+        success: false,
+        message: result.error,
       });
     }
 
-    return res.status(httpStatus.CREATED).json({
+    return res.status(result.created ? httpStatus.CREATED : httpStatus.OK).json({
       success: true,
-      message: "File metadata created",
+      message: result.created ? "File metadata created" : "File metadata updated",
+      data: result.data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.completeUploadsBatch = async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!items.length) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "items array is required",
+      });
+    }
+
+    const limitedItems = items.slice(0, 500);
+    const results = [];
+
+    await runWithConcurrency(limitedItems, 5, async (item = {}) => {
+      try {
+        const completed = await completeUploadMetadataForFile({
+          filepath: item.filepath,
+          fileContentType: item.fileContentType,
+          fileSize: item.fileSize,
+          fileName: item.fileName,
+          userId: item.userId || req.body.userId,
+          authorName: item.authorName || req.body.authorName,
+          providerTimeoutMs: item.providerTimeoutMs || req.body.providerTimeoutMs,
+        });
+
+        if (completed.ok) {
+          results.push({
+            filepath: String(item.filepath || ""),
+            success: true,
+            created: !!completed.created,
+            data: completed.data,
+          });
+        } else {
+          results.push({
+            filepath: String(item.filepath || ""),
+            success: false,
+            error: completed.error,
+            code: completed.code,
+          });
+        }
+      } catch (error) {
+        results.push({
+          filepath: String(item.filepath || ""),
+          success: false,
+          error: error?.message || "Failed to complete upload metadata",
+          code: httpStatus.INTERNAL_SERVER_ERROR,
+        });
+      }
+    });
+
+    return res.status(httpStatus.OK).json({
+      success: true,
       data: {
-        id: fileDoc._id.toString(),
-        path: fileDoc.path,
-        name: fileDoc.name,
-        size: fileDoc.size,
+        total: limitedItems.length,
+        successCount: results.filter((item) => item.success).length,
+        failureCount: results.filter((item) => !item.success).length,
+        items: results,
       },
     });
   } catch (error) {
