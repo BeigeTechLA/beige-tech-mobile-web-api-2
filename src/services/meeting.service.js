@@ -41,7 +41,12 @@ const gatherMeetingIncludedUserIds = (meeting, order) => {
   return [...userIdSet];
 };
 
-const sendMeetingScheduledTemplateEmail = async ({ meeting, order, targetUserIds = [] }) => {
+const sendMeetingScheduledTemplateEmail = async ({
+  meeting,
+  order,
+  targetUserIds = [],
+  recipientEmails = [],
+}) => {
   try {
     if (!MEETING_SCHEDULED_TEMPLATE_ID || !meeting) return;
 
@@ -62,6 +67,11 @@ const sendMeetingScheduledTemplateEmail = async ({ meeting, order, targetUserIds
     const recipients = new Set(
       users.map((user) => normalizeEmail(user?.email || "")).filter(Boolean)
     );
+
+    (Array.isArray(recipientEmails) ? recipientEmails : []).forEach((email) => {
+      const normalized = normalizeEmail(email);
+      if (normalized) recipients.add(normalized);
+    });
 
     const guestEmail = normalizeEmail(
       resolvedOrder?.guest_info?.email ||
@@ -107,6 +117,12 @@ const sendMeetingScheduledTemplateEmail = async ({ meeting, order, targetUserIds
         created_by_name: String(creator?.name || ""),
         sent_at: new Date().toISOString(),
       },
+    });
+    console.log("[meeting] scheduled template email sent", {
+      meetingId: asIdString(meeting?._id),
+      recipients: recipientList,
+      recipientCount: recipientList.length,
+      orderId: asIdString(resolvedOrder?._id),
     });
   } catch (error) {
     console.warn("[meeting] scheduled template email failed:", error?.message || error);
@@ -1637,11 +1653,6 @@ const createMeeting = async (reqBody) => {
 
     }
 
-    await sendMeetingScheduledTemplateEmail({
-      meeting,
-      order,
-    });
-
     // Populate the meeting with participant data before returning
     const populatedMeeting = await Meeting.findById(meeting._id)
       .populate('client_id', 'name email profile_picture')
@@ -1654,6 +1665,24 @@ const createMeeting = async (reqBody) => {
     if (!populatedMeeting) {
       throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, "Failed to retrieve created meeting");
     }
+
+    const directMeetingEmails = [
+      populatedMeeting?.client_id?.email,
+      populatedMeeting?.admin_id?.email,
+      populatedMeeting?.created_by_id?.email,
+      ...(Array.isArray(populatedMeeting?.cp_ids)
+        ? populatedMeeting.cp_ids.map((cp) => cp?.email)
+        : []),
+      ...(Array.isArray(populatedMeeting?.participants)
+        ? populatedMeeting.participants.map((p) => p?.email)
+        : []),
+    ].map((email) => normalizeEmail(email)).filter(Boolean);
+
+    await sendMeetingScheduledTemplateEmail({
+      meeting,
+      order,
+      recipientEmails: directMeetingEmails,
+    });
 
     // Transform the populated meeting to match the expected format
     const meetingData = {
@@ -2191,6 +2220,7 @@ const addMeetingParticipants = async (meetingId, participantData) => {
     await sendMeetingScheduledTemplateEmail({
       meeting,
       targetUserIds: user_ids,
+      recipientEmails: users.map((u) => u?.email).filter(Boolean),
     });
 
     return meeting;

@@ -7,6 +7,14 @@ const {
   PRE_PRODUCTION_BRIEF_UPLOADED_TEMPLATE_ID,
   POST_PRODUCTION_UPLOAD_TEMPLATE_ID,
 } = require("../config/sendgridTemplates");
+const EXTERNAL_MEETINGS_BASE_URL =
+  process.env.EXTERNAL_MEETINGS_API_BASE_URL ||
+  process.env.MEETINGS_API_BASE_URL ||
+  "";
+const EXTERNAL_MEETINGS_KEY =
+  process.env.EXTERNAL_MEETINGS_KEY ||
+  process.env.INTERNAL_FILE_MANAGER_KEY ||
+  "beige-internal-dev-key";
 
 const FACE_SCAN_SERVICE_URL = process.env.FACE_SCAN_SERVICE_URL || "http://localhost:8000";
 const FACE_SCAN_PROVIDER_TIMEOUT_MS = Math.max(
@@ -642,6 +650,87 @@ const resolveOrderRecipientEmail = async (orderDoc) => {
   return normalizeEmail(booking?.guestEmail || "");
 };
 
+const fetchExternalMeetingRecipient = async (orderRef) => {
+  try {
+    const normalizedRef = normalizeExternalId(orderRef);
+    if (!EXTERNAL_MEETINGS_BASE_URL || !normalizedRef) return null;
+
+    const query = new URLSearchParams({ page: "1", limit: "20" }).toString();
+    const response = await fetch(
+      `${EXTERNAL_MEETINGS_BASE_URL.replace(/\/+$/, "")}/order/${encodeURIComponent(normalizedRef)}?${query}`,
+      {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "x-internal-key": EXTERNAL_MEETINGS_KEY,
+        },
+      }
+    );
+
+    if (!response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    const meetings = Array.isArray(payload?.results)
+      ? payload.results
+      : Array.isArray(payload?.data?.results)
+        ? payload.data.results
+        : Array.isArray(payload)
+          ? payload
+          : [];
+
+    if (!meetings.length) return null;
+
+    const users = [];
+    meetings.forEach((meeting) => {
+      if (meeting?.client?.email) {
+        users.push({
+          email: meeting.client.email,
+          name: meeting.client.name || "Client",
+          role: "client",
+        });
+      }
+      if (meeting?.admin?.email) {
+        users.push({
+          email: meeting.admin.email,
+          name: meeting.admin.name || "Admin",
+          role: "admin",
+        });
+      }
+      (Array.isArray(meeting?.participants) ? meeting.participants : []).forEach((p) => {
+        if (p?.email) {
+          users.push({
+            email: p.email,
+            name: p.name || "Participant",
+            role: p.role || "participant",
+          });
+        }
+      });
+      (Array.isArray(meeting?.cps) ? meeting.cps : []).forEach((cp) => {
+        if (cp?.email) {
+          users.push({
+            email: cp.email,
+            name: cp.name || "Creative Partner",
+            role: cp.role || "cp",
+          });
+        }
+      });
+    });
+
+    const normalized = users
+      .map((entry) => ({
+        ...entry,
+        email: normalizeEmail(entry.email),
+      }))
+      .filter((entry) => !!entry.email);
+
+    if (!normalized.length) return null;
+    const clientCandidate = normalized.find((entry) => entry.role === "client");
+    return clientCandidate || normalized[0];
+  } catch (error) {
+    console.warn("[file-manager] external meetings recipient lookup failed:", error?.message || error);
+    return null;
+  }
+};
+
 const sendFileUploadTemplateEmail = async ({
   orderId,
   cleanPath,
@@ -656,12 +745,19 @@ const sendFileUploadTemplateEmail = async ({
     }
 
     const order = await resolveOrderByReference(orderId);
-    if (!order) {
-      console.warn("[file-manager] order not found for upload email", { orderRef: String(orderId) });
-      return;
+    let recipientEmail = order ? await resolveOrderRecipientEmail(order) : "";
+    let recipientName = order
+      ? String(order?.client_id?.name || order?.guest_info?.name || "Client").trim()
+      : "Client";
+
+    if (!recipientEmail) {
+      const externalRecipient = await fetchExternalMeetingRecipient(orderId);
+      if (externalRecipient?.email) {
+        recipientEmail = normalizeEmail(externalRecipient.email);
+        recipientName = String(externalRecipient.name || recipientName || "Client").trim();
+      }
     }
 
-    const recipientEmail = await resolveOrderRecipientEmail(order);
     if (!recipientEmail) {
       console.warn("[file-manager] recipient email not found for upload email", {
         orderId: String(order?._id || ""),
@@ -670,7 +766,6 @@ const sendFileUploadTemplateEmail = async ({
       return;
     }
 
-    const recipientName = String(order?.client_id?.name || order?.guest_info?.name || "Client").trim();
     const uploadPhase = String(cleanPath || "").toLowerCase().includes("/pre-production/")
       ? "pre_production"
       : "post_production";
@@ -680,8 +775,8 @@ const sendFileUploadTemplateEmail = async ({
       templateId,
       dynamicTemplateData: {
         recipient_name: recipientName,
-        order_id: String(order?._id || ""),
-        order_name: String(order?.order_name || ""),
+        order_id: String(order?._id || orderId || ""),
+        order_name: String(order?.order_name || `Project #${orderId}`),
         file_name: String(fileName || cleanPath.split("/").pop() || ""),
         file_path: String(cleanPath || ""),
         upload_phase: uploadPhase,
