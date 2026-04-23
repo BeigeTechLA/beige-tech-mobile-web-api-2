@@ -5,6 +5,81 @@ const ApiError = require("../utils/ApiError");
 const { aggregationPaginate } = require("../models/plugins");
 const { sendNotification } = require("./fcm.service");
 const { createNotificationData, insertNotification } = require('../services/notification.service');
+const sendgridService = require("./sendgrid.service");
+const { MEETING_SCHEDULED_TEMPLATE_ID } = require("../config/sendgridTemplates");
+
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+
+const asIdString = (value) => (value == null ? "" : String(value).trim());
+
+const gatherMeetingIncludedUserIds = (meeting, order) => {
+  const userIdSet = new Set();
+
+  const pushId = (value) => {
+    const id = asIdString(value);
+    if (id && mongoose.Types.ObjectId.isValid(id)) {
+      userIdSet.add(id);
+    }
+  };
+
+  if (meeting?.client_id) pushId(meeting.client_id);
+  else if (order?.client_id) pushId(order.client_id);
+
+  if (meeting?.admin_id) pushId(meeting.admin_id);
+  if (meeting?.created_by_id) pushId(meeting.created_by_id);
+  (meeting?.participants || []).forEach((id) => pushId(id));
+
+  const meetingCpIds = Array.isArray(meeting?.cp_ids) ? meeting.cp_ids : [];
+  if (meetingCpIds.length) {
+    meetingCpIds.forEach((id) => pushId(id));
+  } else if (Array.isArray(order?.cp_ids)) {
+    order.cp_ids.forEach((cp) => {
+      if (cp?.decision !== "cancelled") pushId(cp?.id);
+    });
+  }
+
+  return [...userIdSet];
+};
+
+const sendMeetingScheduledTemplateEmail = async ({ meeting, order, targetUserIds = [] }) => {
+  try {
+    if (!MEETING_SCHEDULED_TEMPLATE_ID || !meeting) return;
+
+    const resolvedTargetIds = targetUserIds.length
+      ? [...new Set(targetUserIds.map((id) => asIdString(id)).filter((id) => mongoose.Types.ObjectId.isValid(id)))]
+      : gatherMeetingIncludedUserIds(meeting, order);
+
+    if (!resolvedTargetIds.length) return;
+
+    const users = await User.find({ _id: { $in: resolvedTargetIds } }).select("name email role").lean();
+    const recipients = [...new Set(users.map((user) => normalizeEmail(user?.email || "")).filter(Boolean))];
+    if (!recipients.length) return;
+
+    const creator = meeting?.created_by_id && typeof meeting.created_by_id === "object"
+      ? meeting.created_by_id
+      : users.find((u) => asIdString(u._id) === asIdString(meeting?.created_by_id));
+
+    await sendgridService.sendDynamicTemplateEmail({
+      to: recipients,
+      templateId: MEETING_SCHEDULED_TEMPLATE_ID,
+      dynamicTemplateData: {
+        meeting_id: asIdString(meeting?._id),
+        order_id: asIdString(order?._id),
+        order_name: String(order?.order_name || ""),
+        meeting_title: String(meeting?.meeting_title || "Meeting Scheduled"),
+        meeting_type: String(meeting?.meeting_type || ""),
+        meeting_status: String(meeting?.meeting_status || ""),
+        meeting_date_time: meeting?.meeting_date_time ? new Date(meeting.meeting_date_time).toISOString() : "",
+        meeting_end_time: meeting?.meeting_end_time ? new Date(meeting.meeting_end_time).toISOString() : "",
+        meet_link: String(meeting?.meetLink || ""),
+        created_by_name: String(creator?.name || ""),
+        sent_at: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.warn("[meeting] scheduled template email failed:", error?.message || error);
+  }
+};
 
 
 /**
@@ -1527,7 +1602,13 @@ const createMeeting = async (reqBody) => {
           }
         });
       }
+
     }
+
+    await sendMeetingScheduledTemplateEmail({
+      meeting,
+      order,
+    });
 
     // Populate the meeting with participant data before returning
     const populatedMeeting = await Meeting.findById(meeting._id)
@@ -2074,6 +2155,11 @@ const addMeetingParticipants = async (meetingId, participantData) => {
         }
       });
     }
+
+    await sendMeetingScheduledTemplateEmail({
+      meeting,
+      targetUserIds: user_ids,
+    });
 
     return meeting;
   } catch (error) {

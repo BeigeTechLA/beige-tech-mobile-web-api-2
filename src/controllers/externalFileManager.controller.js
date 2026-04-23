@@ -1,7 +1,12 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta, FaceEmbedding } = require("../models");
+const { FileMeta, FaceEmbedding, Order } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
+const sendgridService = require("../services/sendgrid.service");
+const {
+  PRE_PRODUCTION_BRIEF_UPLOADED_TEMPLATE_ID,
+  POST_PRODUCTION_UPLOAD_TEMPLATE_ID,
+} = require("../config/sendgridTemplates");
 
 const FACE_SCAN_SERVICE_URL = process.env.FACE_SCAN_SERVICE_URL || "http://localhost:8000";
 const FACE_SCAN_PROVIDER_TIMEOUT_MS = Math.max(
@@ -60,6 +65,7 @@ const parentFolderMetaCache = new Map();
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -593,6 +599,62 @@ const indexEmbeddingForCandidate = async ({
       retryCount: nextRetryCount,
     });
     return { status, reason: error?.message || "Face indexing failed" };
+  }
+};
+
+const resolveUploadTemplateIdByPath = (cleanPath = "") => {
+  const normalizedPath = String(cleanPath || "").toLowerCase();
+  if (normalizedPath.includes("/pre-production/")) {
+    return PRE_PRODUCTION_BRIEF_UPLOADED_TEMPLATE_ID;
+  }
+  if (normalizedPath.includes("/post-production/")) {
+    return POST_PRODUCTION_UPLOAD_TEMPLATE_ID;
+  }
+  return null;
+};
+
+const sendFileUploadTemplateEmail = async ({
+  orderId,
+  cleanPath,
+  fileName,
+  uploadedByName,
+  uploadedById,
+}) => {
+  try {
+    const templateId = resolveUploadTemplateIdByPath(cleanPath);
+    if (!templateId || !orderId || !mongoose.Types.ObjectId.isValid(String(orderId))) {
+      return;
+    }
+
+    const order = await Order.findById(orderId)
+      .populate("client_id", "name email")
+      .lean();
+
+    const recipientEmail = normalizeEmail(order?.client_id?.email || order?.guest_info?.email || "");
+    if (!recipientEmail) return;
+
+    const recipientName = String(order?.client_id?.name || order?.guest_info?.name || "Client").trim();
+    const uploadPhase = String(cleanPath || "").toLowerCase().includes("/pre-production/")
+      ? "pre_production"
+      : "post_production";
+
+    await sendgridService.sendDynamicTemplateEmail({
+      to: recipientEmail,
+      templateId,
+      dynamicTemplateData: {
+        recipient_name: recipientName,
+        order_id: String(order?._id || ""),
+        order_name: String(order?.order_name || ""),
+        file_name: String(fileName || cleanPath.split("/").pop() || ""),
+        file_path: String(cleanPath || ""),
+        upload_phase: uploadPhase,
+        uploaded_by_name: String(uploadedByName || "Beige User"),
+        uploaded_by_id: String(uploadedById || ""),
+        uploaded_at: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.warn("[file-manager] upload template email failed:", error?.message || error);
   }
 };
 
@@ -1164,6 +1226,14 @@ const completeUploadMetadataForFile = async ({
       providerTimeoutMs: resolveProviderTimeoutMs(providerTimeoutMs),
     });
 
+    await sendFileUploadTemplateEmail({
+      orderId: folderMetadata.orderId,
+      cleanPath,
+      fileName: existingFile.name || cleanFileName,
+      uploadedByName: cleanAuthorName,
+      uploadedById: normalizedUserId,
+    });
+
     return {
       ok: true,
       created: false,
@@ -1202,6 +1272,14 @@ const completeUploadMetadataForFile = async ({
     fileName: cleanFileName,
     contentType: cleanContentType,
     providerTimeoutMs: resolveProviderTimeoutMs(providerTimeoutMs),
+  });
+
+  await sendFileUploadTemplateEmail({
+    orderId: folderMetadata.orderId,
+    cleanPath,
+    fileName: fileDoc.name || cleanFileName,
+    uploadedByName: cleanAuthorName,
+    uploadedById: normalizedUserId,
   });
 
   return {

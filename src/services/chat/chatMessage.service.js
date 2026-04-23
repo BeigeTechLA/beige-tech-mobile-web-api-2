@@ -7,6 +7,113 @@ const httpStatus = require("http-status");
 const mongoose = require("mongoose");
 const { ChatRoom, ChatMessage, User } = require("../../models");
 const ApiError = require("../../utils/ApiError");
+const sendgridService = require("../sendgrid.service");
+const { MESSAGING_INITIATED_TEMPLATE_ID } = require("../../config/sendgridTemplates");
+
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+
+const pushRecipientEmail = (recipientMap, email, fallback = {}) => {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return;
+  if (!recipientMap.has(normalized)) {
+    recipientMap.set(normalized, {
+      email: normalized,
+      name: String(fallback.name || "").trim() || "Team Member",
+      role: String(fallback.role || "").trim() || null,
+    });
+  }
+};
+
+const collectAllChatParticipantRefs = (chatRoom = {}) => {
+  const refs = [];
+
+  if (chatRoom.client_id) refs.push({ id: chatRoom.client_id, role: "client" });
+  if (chatRoom.pm_id) refs.push({ id: chatRoom.pm_id, role: "pm" });
+  (chatRoom.cp_ids || []).forEach((cp) => refs.push({ id: cp?.id, email: cp?.email, name: cp?.name, role: "cp" }));
+  (chatRoom.manager_ids || []).forEach((m) =>
+    refs.push({ id: m?.id, email: m?.email, name: m?.name, role: m?.role || "manager" })
+  );
+  (chatRoom.production_ids || []).forEach((p) =>
+    refs.push({ id: p?.id, email: p?.email, name: p?.name, role: p?.role || "production" })
+  );
+  if (chatRoom.client_snapshot?.email || chatRoom.client_snapshot?.id) {
+    refs.push({
+      id: chatRoom.client_snapshot?.id,
+      email: chatRoom.client_snapshot?.email,
+      name: chatRoom.client_snapshot?.name,
+      role: "client",
+    });
+  }
+
+  return refs;
+};
+
+const sendMessageCreatedTemplateEmail = async ({ chatRoomId, senderId, senderName, messagePreview }) => {
+  try {
+    if (!MESSAGING_INITIATED_TEMPLATE_ID) return;
+
+    const chatRoom = await ChatRoom.findById(chatRoomId).lean();
+    if (!chatRoom) return;
+
+    const senderIdStr = String(senderId || "");
+    let senderEmail = "";
+    if (senderIdStr && mongoose.Types.ObjectId.isValid(senderIdStr)) {
+      const senderDoc = await User.findById(senderIdStr).select("email").lean();
+      senderEmail = normalizeEmail(senderDoc?.email || "");
+    }
+
+    const refs = collectAllChatParticipantRefs(chatRoom);
+    const mongoUserIds = [...new Set(
+      refs
+        .map((item) => String(item?.id || "").trim())
+        .filter((id) => mongoose.Types.ObjectId.isValid(id) && id !== senderIdStr)
+    )];
+
+    const users = mongoUserIds.length
+      ? await User.find({ _id: { $in: mongoUserIds } }).select("name email role").lean()
+      : [];
+
+    const recipientMap = new Map();
+    users.forEach((user) => {
+      pushRecipientEmail(recipientMap, user?.email, {
+        name: user?.name,
+        role: user?.role,
+      });
+    });
+
+    refs.forEach((ref) => {
+      const refId = String(ref?.id || "").trim();
+      if (refId && refId === senderIdStr) return;
+      const normalizedRefEmail = normalizeEmail(ref?.email || "");
+      if (!normalizedRefEmail || normalizedRefEmail === senderEmail) return;
+      pushRecipientEmail(recipientMap, normalizedRefEmail, {
+        name: ref?.name,
+        role: ref?.role,
+      });
+    });
+
+    const recipients = Array.from(recipientMap.values()).map((item) => item.email);
+    if (!recipients.length) return;
+
+    await sendgridService.sendDynamicTemplateEmail({
+      to: recipients,
+      templateId: MESSAGING_INITIATED_TEMPLATE_ID,
+      dynamicTemplateData: {
+        chat_room_id: String(chatRoom?._id || chatRoomId),
+        chat_name: String(chatRoom?.name || ""),
+        order_id: String(chatRoom?.order_id || ""),
+        sender_id: senderIdStr,
+        sender_name: String(senderName || "Beige User"),
+        message_preview: String(messagePreview || "").slice(0, 250),
+        sent_at: new Date().toISOString(),
+        event_type: "message_created",
+      },
+    });
+  } catch (error) {
+    // Keep chat delivery non-blocking even if email fails
+    console.warn("[chat] message template email failed:", error?.message || error);
+  }
+};
 
 const toSenderPayload = async (value, fallbackName = null, fallbackEmail = null) => {
   if (!value && !fallbackName && !fallbackEmail) return null;
@@ -149,7 +256,15 @@ const saveChatRoomMessage = async (insertObject) => {
       { new: true }
     );
 
-    return hydrateMessageSender(message);
+    const hydrated = await hydrateMessageSender(message);
+    await sendMessageCreatedTemplateEmail({
+      chatRoomId,
+      senderId: insertObject?.sent_by,
+      senderName: hydrated?.sent_by?.name || insertObject?.sent_by_name || "Beige User",
+      messagePreview: insertObject?.message || insertObject?.file_name || "New chat message",
+    });
+
+    return hydrated;
   } catch (error) {
     throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, error.message);
   }
@@ -320,7 +435,15 @@ const sendReplyMessage = async (messageData) => {
       select: 'message sent_by sent_by_name sent_by_email message_type file_name',
     });
 
-    return hydrateMessageSender(message);
+    const hydrated = await hydrateMessageSender(message);
+    await sendMessageCreatedTemplateEmail({
+      chatRoomId: messageData?.chat_room_id,
+      senderId: messageData?.sent_by,
+      senderName: hydrated?.sent_by?.name || messageData?.sent_by_name || "Beige User",
+      messagePreview: messageData?.message || messageData?.file_name || "New chat reply",
+    });
+
+    return hydrated;
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, error.message);
