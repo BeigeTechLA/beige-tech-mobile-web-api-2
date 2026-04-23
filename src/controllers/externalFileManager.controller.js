@@ -1,6 +1,6 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta, FaceEmbedding, Order } = require("../models");
+const { FileMeta, FaceEmbedding, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
 const sendgridService = require("../services/sendgrid.service");
 const {
@@ -613,6 +613,35 @@ const resolveUploadTemplateIdByPath = (cleanPath = "") => {
   return null;
 };
 
+const resolveOrderByReference = async (orderRef) => {
+  const normalizedRef = normalizeExternalId(orderRef);
+  if (!normalizedRef) return null;
+
+  const filters = [];
+  if (mongoose.Types.ObjectId.isValid(normalizedRef)) {
+    filters.push({ _id: normalizedRef });
+  }
+  filters.push({ shoot_id: normalizedRef });
+  filters.push({ order_name: { $regex: `${escapeRegex(normalizedRef)}$`, $options: "i" } });
+
+  return Order.findOne(filters.length === 1 ? filters[0] : { $or: filters })
+    .populate("client_id", "name email")
+    .lean();
+};
+
+const resolveOrderRecipientEmail = async (orderDoc) => {
+  if (!orderDoc) return "";
+
+  const primary = normalizeEmail(orderDoc?.client_id?.email || orderDoc?.guest_info?.email || "");
+  if (primary) return primary;
+
+  const booking = await Booking.findOne({ orderId: orderDoc._id })
+    .sort({ createdAt: -1 })
+    .select("guestEmail")
+    .lean();
+  return normalizeEmail(booking?.guestEmail || "");
+};
+
 const sendFileUploadTemplateEmail = async ({
   orderId,
   cleanPath,
@@ -622,16 +651,24 @@ const sendFileUploadTemplateEmail = async ({
 }) => {
   try {
     const templateId = resolveUploadTemplateIdByPath(cleanPath);
-    if (!templateId || !orderId || !mongoose.Types.ObjectId.isValid(String(orderId))) {
+    if (!templateId || !orderId) {
       return;
     }
 
-    const order = await Order.findById(orderId)
-      .populate("client_id", "name email")
-      .lean();
+    const order = await resolveOrderByReference(orderId);
+    if (!order) {
+      console.warn("[file-manager] order not found for upload email", { orderRef: String(orderId) });
+      return;
+    }
 
-    const recipientEmail = normalizeEmail(order?.client_id?.email || order?.guest_info?.email || "");
-    if (!recipientEmail) return;
+    const recipientEmail = await resolveOrderRecipientEmail(order);
+    if (!recipientEmail) {
+      console.warn("[file-manager] recipient email not found for upload email", {
+        orderId: String(order?._id || ""),
+        orderRef: String(orderId),
+      });
+      return;
+    }
 
     const recipientName = String(order?.client_id?.name || order?.guest_info?.name || "Client").trim();
     const uploadPhase = String(cleanPath || "").toLowerCase().includes("/pre-production/")

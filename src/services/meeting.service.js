@@ -1,6 +1,6 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { Meeting, Order, User } = require("../models");
+const { Meeting, Order, User, Booking } = require("../models");
 const ApiError = require("../utils/ApiError");
 const { aggregationPaginate } = require("../models/plugins");
 const { sendNotification } = require("./fcm.service");
@@ -45,27 +45,59 @@ const sendMeetingScheduledTemplateEmail = async ({ meeting, order, targetUserIds
   try {
     if (!MEETING_SCHEDULED_TEMPLATE_ID || !meeting) return;
 
+    let resolvedOrder = order || null;
+    if (!resolvedOrder && meeting?._id) {
+      resolvedOrder = await Order.findOne({ meeting_date_times: meeting._id })
+        .populate("client_id", "name email")
+        .lean();
+    }
+
     const resolvedTargetIds = targetUserIds.length
       ? [...new Set(targetUserIds.map((id) => asIdString(id)).filter((id) => mongoose.Types.ObjectId.isValid(id)))]
-      : gatherMeetingIncludedUserIds(meeting, order);
+      : gatherMeetingIncludedUserIds(meeting, resolvedOrder);
 
-    if (!resolvedTargetIds.length) return;
+    const users = resolvedTargetIds.length
+      ? await User.find({ _id: { $in: resolvedTargetIds } }).select("name email role").lean()
+      : [];
+    const recipients = new Set(
+      users.map((user) => normalizeEmail(user?.email || "")).filter(Boolean)
+    );
 
-    const users = await User.find({ _id: { $in: resolvedTargetIds } }).select("name email role").lean();
-    const recipients = [...new Set(users.map((user) => normalizeEmail(user?.email || "")).filter(Boolean))];
-    if (!recipients.length) return;
+    const guestEmail = normalizeEmail(
+      resolvedOrder?.guest_info?.email ||
+      ""
+    );
+    if (guestEmail) recipients.add(guestEmail);
+
+    if (resolvedOrder?._id) {
+      const booking = await Booking.findOne({ orderId: resolvedOrder._id })
+        .sort({ createdAt: -1 })
+        .select("guestEmail")
+        .lean();
+      const bookingGuestEmail = normalizeEmail(booking?.guestEmail || "");
+      if (bookingGuestEmail) recipients.add(bookingGuestEmail);
+    }
+
+    const recipientList = [...recipients];
+    if (!recipientList.length) {
+      console.warn("[meeting] no recipient emails found for scheduled template", {
+        meetingId: asIdString(meeting?._id),
+        orderId: asIdString(resolvedOrder?._id),
+      });
+      return;
+    }
 
     const creator = meeting?.created_by_id && typeof meeting.created_by_id === "object"
       ? meeting.created_by_id
       : users.find((u) => asIdString(u._id) === asIdString(meeting?.created_by_id));
 
     await sendgridService.sendDynamicTemplateEmail({
-      to: recipients,
+      to: recipientList,
       templateId: MEETING_SCHEDULED_TEMPLATE_ID,
       dynamicTemplateData: {
         meeting_id: asIdString(meeting?._id),
-        order_id: asIdString(order?._id),
-        order_name: String(order?.order_name || ""),
+        order_id: asIdString(resolvedOrder?._id),
+        order_name: String(resolvedOrder?.order_name || ""),
         meeting_title: String(meeting?.meeting_title || "Meeting Scheduled"),
         meeting_type: String(meeting?.meeting_type || ""),
         meeting_status: String(meeting?.meeting_status || ""),
