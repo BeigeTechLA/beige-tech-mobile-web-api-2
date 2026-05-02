@@ -8,6 +8,10 @@ const mongoose = require("mongoose");
 const { ChatRoom, ChatMessage, User } = require("../../models");
 const ApiError = require("../../utils/ApiError");
 const encryptionService = require("../encryption.service");
+const sendgridService = require("../sendgrid.service");
+const { MESSAGING_INITIATED_TEMPLATE_ID } = require("../../config/sendgridTemplates");
+
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 
 const toParticipantPayload = async (entry, fallbackRole = null) => {
   if (!entry) return null;
@@ -94,6 +98,67 @@ const normalizeRemovalRole = (role) => {
   return normalizedRole;
 };
 
+const sendAddedParticipantsTemplateEmail = async ({
+  chatRoom,
+  addedParticipantIds = [],
+  addedParticipantEmails = [],
+  adminName,
+}) => {
+  try {
+    if (!MESSAGING_INITIATED_TEMPLATE_ID) return;
+
+    const objectIds = [...new Set(
+      (addedParticipantIds || [])
+        .map((id) => String(id || "").trim())
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    )];
+
+    const users = objectIds.length
+      ? await User.find({ _id: { $in: objectIds } }).select("name email role").lean()
+      : [];
+
+    const recipients = new Map();
+    users.forEach((user) => {
+      const email = normalizeEmail(user?.email || "");
+      if (!email) return;
+      recipients.set(email, {
+        email,
+        name: String(user?.name || "").trim() || "Team Member",
+        role: String(user?.role || "").trim() || null,
+      });
+    });
+
+    (addedParticipantEmails || []).forEach((entry) => {
+      const email = normalizeEmail(entry?.email || entry);
+      if (!email || recipients.has(email)) return;
+      recipients.set(email, {
+        email,
+        name: String(entry?.name || "").trim() || "Team Member",
+        role: String(entry?.role || "").trim() || null,
+      });
+    });
+
+    const recipientEmails = Array.from(recipients.keys());
+    if (!recipientEmails.length) return;
+
+    await sendgridService.sendDynamicTemplateEmail({
+      to: recipientEmails,
+      templateId: MESSAGING_INITIATED_TEMPLATE_ID,
+      dynamicTemplateData: {
+        chat_room_id: String(chatRoom?._id || ""),
+        chat_name: String(chatRoom?.name || ""),
+        order_id: String(chatRoom?.order_id || ""),
+        sender_name: String(adminName || "Beige Admin"),
+        message_preview: "You have been added to this conversation.",
+        event_type: "participant_added",
+        sent_at: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.warn("[chat] added-participant template email failed:", error?.message || error);
+  }
+};
+
 /**
  * Add participants to a chat room (Admin only)
  */
@@ -122,6 +187,7 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
 
     const addedUserIds = [];
     const addedUserNames = [];
+    const addedParticipantEmails = [];
 
     for (const user of normalizedParticipants) {
       const participantEntry = {
@@ -149,6 +215,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
             }
             addedUserIds.push(user.id);
             addedUserNames.push(user.name);
+            if (user.email) {
+              addedParticipantEmails.push({
+                email: user.email,
+                name: user.name,
+                role: participantEntry.role || role || "client",
+              });
+            }
           }
           break;
         case 'cp':
@@ -158,6 +231,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
             chatRoom.cp_ids.push(participantEntry);
             addedUserIds.push(user.id);
             addedUserNames.push(user.name);
+            if (user.email) {
+              addedParticipantEmails.push({
+                email: user.email,
+                name: user.name,
+                role: participantEntry.role || role || "cp",
+              });
+            }
           }
           break;
         case 'pm':
@@ -165,6 +245,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
             chatRoom.pm_id = user.id;
             addedUserIds.push(user.id);
             addedUserNames.push(user.name);
+            if (user.email) {
+              addedParticipantEmails.push({
+                email: user.email,
+                name: user.name,
+                role: participantEntry.role || role || "pm",
+              });
+            }
           }
           break;
         case 'production':
@@ -175,6 +262,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
             chatRoom.production_ids.push(participantEntry);
             addedUserIds.push(user.id);
             addedUserNames.push(user.name);
+            if (user.email) {
+              addedParticipantEmails.push({
+                email: user.email,
+                name: user.name,
+                role: participantEntry.role || role || "production",
+              });
+            }
           }
           break;
         case 'manager':
@@ -186,6 +280,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
             chatRoom.manager_ids.push(participantEntry);
             addedUserIds.push(user.id);
             addedUserNames.push(user.name);
+            if (user.email) {
+              addedParticipantEmails.push({
+                email: user.email,
+                name: user.name,
+                role: participantEntry.role || role || "manager",
+              });
+            }
           }
           break;
         default:
@@ -257,6 +358,13 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
 
     // Update last message
     await ChatRoom.findByIdAndUpdate(chatRoomId, { last_message: systemMessage._id });
+
+    await sendAddedParticipantsTemplateEmail({
+      chatRoom,
+      addedParticipantIds: addedUserIds,
+      addedParticipantEmails,
+      adminName,
+    });
 
     return { chatRoom, systemMessage };
   } catch (error) {

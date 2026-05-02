@@ -1,10 +1,133 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { Meeting, Order, User } = require("../models");
+const { Meeting, Order, User, Booking } = require("../models");
 const ApiError = require("../utils/ApiError");
 const { aggregationPaginate } = require("../models/plugins");
 const { sendNotification } = require("./fcm.service");
 const { createNotificationData, insertNotification } = require('../services/notification.service');
+const sendgridService = require("./sendgrid.service");
+const { MEETING_SCHEDULED_TEMPLATE_ID } = require("../config/sendgridTemplates");
+
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+
+const asIdString = (value) => (value == null ? "" : String(value).trim());
+
+const gatherMeetingIncludedUserIds = (meeting, order) => {
+  const userIdSet = new Set();
+
+  const pushId = (value) => {
+    const id = asIdString(value);
+    if (id && mongoose.Types.ObjectId.isValid(id)) {
+      userIdSet.add(id);
+    }
+  };
+
+  if (meeting?.client_id) pushId(meeting.client_id);
+  else if (order?.client_id) pushId(order.client_id);
+
+  if (meeting?.admin_id) pushId(meeting.admin_id);
+  if (meeting?.created_by_id) pushId(meeting.created_by_id);
+  (meeting?.participants || []).forEach((id) => pushId(id));
+
+  const meetingCpIds = Array.isArray(meeting?.cp_ids) ? meeting.cp_ids : [];
+  if (meetingCpIds.length) {
+    meetingCpIds.forEach((id) => pushId(id));
+  } else if (Array.isArray(order?.cp_ids)) {
+    order.cp_ids.forEach((cp) => {
+      if (cp?.decision !== "cancelled") pushId(cp?.id);
+    });
+  }
+
+  return [...userIdSet];
+};
+
+const sendMeetingScheduledTemplateEmail = async ({
+  meeting,
+  order,
+  targetUserIds = [],
+  recipientEmails = [],
+}) => {
+  try {
+    if (!MEETING_SCHEDULED_TEMPLATE_ID || !meeting) return;
+
+    let resolvedOrder = order || null;
+    if (!resolvedOrder && meeting?._id) {
+      resolvedOrder = await Order.findOne({ meeting_date_times: meeting._id })
+        .populate("client_id", "name email")
+        .lean();
+    }
+
+    const resolvedTargetIds = targetUserIds.length
+      ? [...new Set(targetUserIds.map((id) => asIdString(id)).filter((id) => mongoose.Types.ObjectId.isValid(id)))]
+      : gatherMeetingIncludedUserIds(meeting, resolvedOrder);
+
+    const users = resolvedTargetIds.length
+      ? await User.find({ _id: { $in: resolvedTargetIds } }).select("name email role").lean()
+      : [];
+    const recipients = new Set(
+      users.map((user) => normalizeEmail(user?.email || "")).filter(Boolean)
+    );
+
+    (Array.isArray(recipientEmails) ? recipientEmails : []).forEach((email) => {
+      const normalized = normalizeEmail(email);
+      if (normalized) recipients.add(normalized);
+    });
+
+    const guestEmail = normalizeEmail(
+      resolvedOrder?.guest_info?.email ||
+      ""
+    );
+    if (guestEmail) recipients.add(guestEmail);
+
+    if (resolvedOrder?._id) {
+      const booking = await Booking.findOne({ orderId: resolvedOrder._id })
+        .sort({ createdAt: -1 })
+        .select("guestEmail")
+        .lean();
+      const bookingGuestEmail = normalizeEmail(booking?.guestEmail || "");
+      if (bookingGuestEmail) recipients.add(bookingGuestEmail);
+    }
+
+    const recipientList = [...recipients];
+    if (!recipientList.length) {
+      console.warn("[meeting] no recipient emails found for scheduled template", {
+        meetingId: asIdString(meeting?._id),
+        orderId: asIdString(resolvedOrder?._id),
+      });
+      return;
+    }
+
+    const creator = meeting?.created_by_id && typeof meeting.created_by_id === "object"
+      ? meeting.created_by_id
+      : users.find((u) => asIdString(u._id) === asIdString(meeting?.created_by_id));
+
+    await sendgridService.sendDynamicTemplateEmail({
+      to: recipientList,
+      templateId: MEETING_SCHEDULED_TEMPLATE_ID,
+      dynamicTemplateData: {
+        meeting_id: asIdString(meeting?._id),
+        order_id: asIdString(resolvedOrder?._id),
+        order_name: String(resolvedOrder?.order_name || ""),
+        meeting_title: String(meeting?.meeting_title || "Meeting Scheduled"),
+        meeting_type: String(meeting?.meeting_type || ""),
+        meeting_status: String(meeting?.meeting_status || ""),
+        meeting_date_time: meeting?.meeting_date_time ? new Date(meeting.meeting_date_time).toISOString() : "",
+        meeting_end_time: meeting?.meeting_end_time ? new Date(meeting.meeting_end_time).toISOString() : "",
+        meet_link: String(meeting?.meetLink || ""),
+        created_by_name: String(creator?.name || ""),
+        sent_at: new Date().toISOString(),
+      },
+    });
+    console.log("[meeting] scheduled template email sent", {
+      meetingId: asIdString(meeting?._id),
+      recipients: recipientList,
+      recipientCount: recipientList.length,
+      orderId: asIdString(resolvedOrder?._id),
+    });
+  } catch (error) {
+    console.warn("[meeting] scheduled template email failed:", error?.message || error);
+  }
+};
 
 
 /**
@@ -1527,6 +1650,7 @@ const createMeeting = async (reqBody) => {
           }
         });
       }
+
     }
 
     // Populate the meeting with participant data before returning
@@ -1541,6 +1665,24 @@ const createMeeting = async (reqBody) => {
     if (!populatedMeeting) {
       throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, "Failed to retrieve created meeting");
     }
+
+    const directMeetingEmails = [
+      populatedMeeting?.client_id?.email,
+      populatedMeeting?.admin_id?.email,
+      populatedMeeting?.created_by_id?.email,
+      ...(Array.isArray(populatedMeeting?.cp_ids)
+        ? populatedMeeting.cp_ids.map((cp) => cp?.email)
+        : []),
+      ...(Array.isArray(populatedMeeting?.participants)
+        ? populatedMeeting.participants.map((p) => p?.email)
+        : []),
+    ].map((email) => normalizeEmail(email)).filter(Boolean);
+
+    await sendMeetingScheduledTemplateEmail({
+      meeting,
+      order,
+      recipientEmails: directMeetingEmails,
+    });
 
     // Transform the populated meeting to match the expected format
     const meetingData = {
@@ -2074,6 +2216,12 @@ const addMeetingParticipants = async (meetingId, participantData) => {
         }
       });
     }
+
+    await sendMeetingScheduledTemplateEmail({
+      meeting,
+      targetUserIds: user_ids,
+      recipientEmails: users.map((u) => u?.email).filter(Boolean),
+    });
 
     return meeting;
   } catch (error) {

@@ -63,6 +63,11 @@ try {
 
 const CDN_URL = process.env.CDN_URL || null;
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || "*";
+const UPLOAD_FOLDER_METADATA_CACHE_TTL_MS = Math.max(
+  10000,
+  Number(process.env.UPLOAD_FOLDER_METADATA_CACHE_TTL_MS || 120000)
+);
+const uploadFolderMetadataCache = new Map();
 
 // let CDN_ADMINS = [process.env.CDN_ADMIN];
 let CDN_ADMINS = [config.GCP.cdnAdmins];
@@ -118,9 +123,59 @@ async function setBucketCors() {
   CorsAlreadyChecked = true;
 }
 
-const createFolder = async (folderName, cpIds, orderId, client_id, shootName = null, clientName = null, shootId = null) => {
+const getCachedFolderCreatedByUsers = async (folderPath = "") => {
+  if (!folderPath) return [];
+  const cacheKey = String(folderPath || "").toLowerCase();
+  const now = Date.now();
+  const cached = uploadFolderMetadataCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.userIds;
+  }
+
+  let userIds = [];
+  try {
+    const folder = bucket.file(folderPath);
+    const [exists] = await folder.exists();
+    if (exists) {
+      const [folderMetadata] = await folder.getMetadata();
+      const createdBy = folderMetadata?.metadata?.createdBy;
+
+      if (typeof createdBy === "string") {
+        try {
+          const parsed = JSON.parse(createdBy);
+          userIds = Array.isArray(parsed) ? parsed.map((id) => String(id)) : [String(createdBy)];
+        } catch (parseError) {
+          userIds = [String(createdBy)];
+        }
+      } else if (Array.isArray(createdBy)) {
+        userIds = createdBy.map((id) => String(id));
+      }
+    }
+  } catch (error) {
+    logger.warn(`Failed to load folder metadata cache for ${folderPath}: ${error.message}`);
+  }
+
+  const deduped = [...new Set(userIds.filter(Boolean))];
+  uploadFolderMetadataCache.set(cacheKey, {
+    userIds: deduped,
+    expiresAt: now + UPLOAD_FOLDER_METADATA_CACHE_TTL_MS,
+  });
+  return deduped;
+};
+
+const createFolder = async (
+  folderName,
+  cpIds,
+  orderId,
+  client_id,
+  shootName = null,
+  clientName = null,
+  shootId = null,
+  createOptions = {}
+) => {
   checkGcpEnabled();
   let options = {};
+  const shouldSkipWorkflowSubfolders = Boolean(createOptions?.skipWorkflowSubfolders);
 
   // Determine the userId - prioritize client_id, then try to extract from cpIds
   let userId = client_id;
@@ -274,9 +329,16 @@ const createFolder = async (folderName, cpIds, orderId, client_id, shootName = n
     // Create production workflow subfolders ONLY for client folders (not custom folders)
     // Client folders are identified by having an orderId, shootName, or clientName
     // Custom folders created manually by users should NOT have workflow subfolders
-    const isClientFolder = orderId || shootName || clientName;
+    const isClientFolder = Boolean(orderId || shootName || clientName);
+    const normalizedFolderPath = pathWithoutPrefix.replace(/\/$/, "");
+    const isRootFolder = !normalizedFolderPath.includes("/");
+    const shouldCreateWorkflowSubfolders =
+      folderDoc &&
+      isClientFolder &&
+      isRootFolder &&
+      !shouldSkipWorkflowSubfolders;
 
-    if (folderDoc && isClientFolder) {
+    if (shouldCreateWorkflowSubfolders) {
       try {
         await createProductionSubfolders(
           pathWithoutPrefix,
@@ -290,6 +352,10 @@ const createFolder = async (folderName, cpIds, orderId, client_id, shootName = n
         console.error('⚠️ Error creating production subfolders:', subfolderError);
         // Don't fail the main folder creation if subfolder creation fails
       }
+    } else if (folderDoc && shouldSkipWorkflowSubfolders) {
+      console.log('ℹ️ Skipping workflow subfolder creation - explicitly disabled for this request');
+    } else if (folderDoc && !isRootFolder) {
+      console.log('ℹ️ Skipping workflow subfolder creation - this is a nested folder');
     } else if (folderDoc) {
       console.log('ℹ️ Skipping workflow subfolder creation - this is a custom folder, not a client folder');
     }
@@ -1114,41 +1180,13 @@ const uploadFile = async (
   // Initialize array of user IDs with the provided userId (if any)
   let userIds = userId ? [userId] : []; // Client Id added here
   
-  // If this file is in a folder, check the folder's metadata for createdBy users
+  // If this file is in a folder, read cached folder metadata for createdBy users
+  // to avoid repeated GCS metadata calls during large multi-file uploads.
   if (folderPath) {
     try {
-      const folder = bucket.file(folderPath);
-      const [exists] = await folder.exists();
-      
-      if (exists) {
-        const [folderMetadata] = await folder.getMetadata();
-        
-        if (folderMetadata.metadata && folderMetadata.metadata.createdBy) {
-          try {
-            let folderCreatedBy;
-            
-            // Handle different formats of createdBy metadata
-            if (typeof folderMetadata.metadata.createdBy === 'string') {
-              try {
-                // Try to parse as JSON
-                folderCreatedBy = JSON.parse(folderMetadata.metadata.createdBy);
-              } catch (parseError) {
-                // If parsing fails, treat as a single string ID
-                folderCreatedBy = [folderMetadata.metadata.createdBy];
-              }
-            } else if (Array.isArray(folderMetadata.metadata.createdBy)) {
-              // If it's already an array, use it directly
-              folderCreatedBy = folderMetadata.metadata.createdBy;
-            }
-            
-            // If we have valid folder users, merge them with our list
-            if (Array.isArray(folderCreatedBy)) {
-              userIds = [...new Set([...userIds, ...folderCreatedBy])];
-            }
-          } catch (e) {
-            console.error('Error processing folder createdBy metadata:', e);
-          }
-        }
+      const folderCreatedBy = await getCachedFolderCreatedByUsers(folderPath);
+      if (folderCreatedBy.length) {
+        userIds = [...new Set([...userIds, ...folderCreatedBy])];
       }
     } catch (e) {
       console.error('Error getting folder metadata:', e);
