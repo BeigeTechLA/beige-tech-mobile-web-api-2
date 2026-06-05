@@ -28,6 +28,8 @@ router.post("/upload-policy", externalFileManagerController.getUploadPolicy);
 router.post("/upload-policies/batch", externalFileManagerController.getUploadPoliciesBatch);
 router.post("/file-uploaded", externalFileManagerController.completeUpload);
 router.post("/files-uploaded/batch", externalFileManagerController.completeUploadsBatch);
+router.post("/copy-files", externalFileManagerController.copyFiles);
+router.post("/revision-file/review", externalFileManagerController.reviewRevisionFile);
 router.post("/face-scan/search", externalFileManagerController.searchFaceMatches);
 router.get("/face-scan/index-status/:externalId", externalFileManagerController.getFaceScanIndexStatus);
 router.post("/face-scan/reindex", externalFileManagerController.reindexFaceEmbeddings);
