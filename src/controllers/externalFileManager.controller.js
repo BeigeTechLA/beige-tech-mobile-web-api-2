@@ -73,6 +73,7 @@ const parentFolderMetaCache = new Map();
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
+const isCommonEventExternalId = (value) => normalizeExternalId(value).startsWith("event_");
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1166,7 +1167,8 @@ exports.getWorkspaceFiles = async (req, res, next) => {
 exports.createFolder = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
-    const phase = String(req.body.phase || "root").trim().toLowerCase();
+    const requestedPhase = String(req.body.phase || "").trim().toLowerCase();
+    const phase = requestedPhase || "root";
     const subPath = String(req.body.path || "").trim();
     const folderName = String(req.body.folderName || req.body.name || "").trim();
 
@@ -1177,7 +1179,7 @@ exports.createFolder = async (req, res, next) => {
       });
     }
 
-    if (!["pre", "post"].includes(phase)) {
+    if (!["pre", "post"].includes(phase) && !(phase === "root" && isCommonEventExternalId(externalId))) {
       return res.status(httpStatus.BAD_REQUEST).json({
         success: false,
         message: "Folders can only be created inside Pre Production or Post Production",

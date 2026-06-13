@@ -3,6 +3,7 @@ const { Server } = require("socket.io");
 const chatService = require("./chat.service");
 const logger = require("../config/logger");
 const { ChatRoom, User } = require("../models");
+const { Types } = require("mongoose");
 const { sendNotification } = require("./fcm.service");
 const notificationService = require("./notification.service");
 
@@ -21,6 +22,14 @@ let ioInstance = null;
 function getIO() {
   return ioInstance;
 }
+
+const isMongoObjectId = (value) => Types.ObjectId.isValid(String(value || "").trim());
+
+const findMongoUserIfPossible = async (candidateUserId, projection = "_id isActive") => {
+  const normalized = String(candidateUserId || "").trim();
+  if (!normalized || !isMongoObjectId(normalized)) return null;
+  return User.findById(normalized).select(projection);
+};
 
 // Function to emit notifications to specific users
 function emitNotificationToUser(userId, notification) {
@@ -145,23 +154,14 @@ function startSocketServer(server) {
           return;
         }
 
-        // Verify user exists in database
-        const user = await User.findById(userId).select('_id isActive');
-        if (!user) {
-          logger.error(`joinRoom: User ${userId} not found in database`);
-          io.to(socketId).emit("roomJoined", { 
-            success: false, 
-            error: "User not found. Please log in again." 
-          });
-          return;
-        }
-
-        // Check if user account is active
-        if (user.isActive === false) {
+        // For bridge users (numeric IDs), skip Mongo-only user lookup.
+        // For native Mongo users, keep active-user validation.
+        const user = await findMongoUserIfPossible(userId, "_id isActive");
+        if (user && user.isActive === false) {
           logger.error(`joinRoom: User ${userId} is deactivated`);
-          io.to(socketId).emit("roomJoined", { 
-            success: false, 
-            error: "Your account has been deactivated. You cannot access chat rooms." 
+          io.to(socketId).emit("roomJoined", {
+            success: false,
+            error: "Your account has been deactivated. You cannot access chat rooms."
           });
           return;
         }
@@ -263,18 +263,9 @@ function startSocketServer(server) {
           }
 
           // Verify user exists in database (authentication check)
-          const senderUser = await User.findById(userId).select('isActive');
-          if (!senderUser) {
-            logger.warn(`Invalid user ${userId} attempted to send message - user not found in database`);
-            io.to(socketId).emit("message", {
-              success: false,
-              error: "User not found. Please log in again."
-            });
-            return;
-          }
-
-          // Check if user is active (per PRD: deactivated users cannot send messages)
-          if (senderUser.isActive === false) {
+          const senderUser = await findMongoUserIfPossible(userId, "isActive");
+          // Check if user is active (applies to Mongo-native users only)
+          if (senderUser && senderUser.isActive === false) {
             logger.warn(`Deactivated user ${userId} attempted to send message`);
             io.to(socketId).emit("message", {
               success: false,
@@ -595,7 +586,7 @@ function startSocketServer(server) {
         // Get user name - fallback to fetching from DB if not set
         let reactUserName = userName;
         if (!reactUserName && userId) {
-          const reactUser = await User.findById(userId).select('name');
+        const reactUser = await findMongoUserIfPossible(userId, "name");
           reactUserName = reactUser?.name || 'Unknown';
         }
 
@@ -994,8 +985,12 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
 
       logger.info(`[notifyAllParticipants] Notification data: ${JSON.stringify(notificationData)}`);
 
-      const savedNotification = await notificationService.insertNotification(notificationData);
-      logger.info(`[notifyAllParticipants] Notification saved successfully with ID: ${savedNotification?._id}`);
+      if (notificationService && typeof notificationService.insertNotification === "function") {
+        const savedNotification = await notificationService.insertNotification(notificationData);
+        logger.info(`[notifyAllParticipants] Notification saved successfully with ID: ${savedNotification?._id}`);
+      } else {
+        logger.warn("[notifyAllParticipants] notificationService.insertNotification is unavailable; skipping DB notification write");
+      }
     } catch (dbError) {
       logger.error(`[notifyAllParticipants] Error saving notification to database: ${dbError.message}`);
       logger.error(`[notifyAllParticipants] Full error: ${JSON.stringify(dbError, Object.getOwnPropertyNames(dbError))}`);
