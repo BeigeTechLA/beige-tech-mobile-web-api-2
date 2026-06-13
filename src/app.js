@@ -19,6 +19,7 @@ const ApiError = require("./utils/ApiError");
 const monitoringService = require("./services/monitoring.service");
 
 const app = express();
+const requestBodyLimit = process.env.REQUEST_BODY_LIMIT || "25mb";
 
 // Initialize monitoring (Sentry) early in the app lifecycle
 monitoringService.initialize();
@@ -88,11 +89,9 @@ app.use(helmet());
 const stripeWebhookRoute = require("./routes/v1/stripe-webhook.route");
 app.use("/v1/stripe", stripeWebhookRoute);
 
-// Parse JSON request bodies
-app.use(express.json());
-
-// Parse URL-encoded request bodies
-app.use(express.urlencoded({ extended: true }));
+// Parse request bodies (increased for face-scan base64 payloads)
+app.use(express.json({ limit: requestBodyLimit }));
+app.use(express.urlencoded({ extended: true, limit: requestBodyLimit }));
 
 // Sanitize request data
 app.use(xss());

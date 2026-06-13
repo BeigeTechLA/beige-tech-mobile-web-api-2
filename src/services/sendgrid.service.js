@@ -440,11 +440,95 @@ const validateConfiguration = async () => {
   }
 };
 
+const normalizeRecipients = (to) => {
+  const recipientList = Array.isArray(to) ? to : [to];
+  const normalized = recipientList
+    .map((email) => String(email || "").trim().toLowerCase())
+    .filter((email) => !!email);
+  return [...new Set(normalized)];
+};
+
+/**
+ * Send SendGrid dynamic template email.
+ * Supports single recipient or array of recipients.
+ *
+ * @param {Object} options
+ * @param {string|string[]} options.to
+ * @param {string} options.templateId
+ * @param {Object} [options.dynamicTemplateData]
+ * @param {Object} [options.from]
+ * @returns {Promise<Object>}
+ */
+const sendDynamicTemplateEmail = async (options = {}) => {
+  try {
+    if (!config.sendgrid.apiKey) {
+      logger.warn('[SendGrid] API key not configured - skipping template email send');
+      return { success: false, error: 'SendGrid not configured' };
+    }
+
+    const { to, templateId, dynamicTemplateData = {}, from } = options;
+    const recipients = normalizeRecipients(to);
+
+    if (!templateId) {
+      return { success: false, error: 'templateId is required' };
+    }
+
+    if (!recipients.length) {
+      return { success: false, error: 'At least one valid recipient email is required' };
+    }
+
+    const sendPromises = recipients.map((email) => {
+      const msg = {
+        to: email,
+        from: from || {
+          email: 'noreply@beige.app',
+          name: 'Beige Corporation',
+        },
+        templateId,
+        dynamicTemplateData,
+      };
+      return sgMail.send(msg);
+    });
+
+    const settled = await Promise.allSettled(sendPromises);
+    const successCount = settled.filter((item) => item.status === 'fulfilled').length;
+    const failed = settled
+      .map((item, index) => ({ item, email: recipients[index] }))
+      .filter((entry) => entry.item.status === 'rejected')
+      .map((entry) => ({
+        email: entry.email,
+        error: entry.item.reason?.message || 'Unknown SendGrid error',
+      }));
+
+    if (failed.length) {
+      logger.warn(
+        `[SendGrid] Template email partial failure template=${templateId}, success=${successCount}, failed=${failed.length}`
+      );
+    } else {
+      logger.info(
+        `[SendGrid] Template email sent template=${templateId}, recipients=${successCount}`
+      );
+    }
+
+    return {
+      success: failed.length === 0,
+      partialSuccess: successCount > 0 && failed.length > 0,
+      sentCount: successCount,
+      failedCount: failed.length,
+      failedRecipients: failed,
+    };
+  } catch (error) {
+    logger.error(`[SendGrid] Failed to send template email: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+};
+
 module.exports = {
   sendBookingConfirmationEmail,
   sendOpsNotificationEmail,
   sendHtmlEmail,
   sendResetPasswordEmail,
   sendCredentialsEmail,
-  validateConfiguration
+  validateConfiguration,
+  sendDynamicTemplateEmail,
 };
