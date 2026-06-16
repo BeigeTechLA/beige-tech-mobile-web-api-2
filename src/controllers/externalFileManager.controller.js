@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const { FileMeta, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
+const { ensurePostProductionFolder } = gcpFileService;
 const sendgridService = require("../services/sendgrid.service");
 const {
   PRE_PRODUCTION_BRIEF_UPLOADED_TEMPLATE_ID,
@@ -353,6 +354,7 @@ const listWorkspaceContents = async (basePath) => {
         size: doc.size || 0,
         contentType: doc.contentType || doc.mimeType || "",
         isPublic: doc.isPublic || false,
+        metadata: doc.metadata || {},
         updatedAt: doc.updatedAt,
         createdAt: doc.createdAt,
       });
@@ -1091,11 +1093,8 @@ exports.createWorkspace = async (req, res, next) => {
       });
     }
 
-    let workspace = await findWorkspaceRoot(externalId);
-    if (!workspace) {
-      await gcpFileService.createFolder(folderName, null, externalId, null);
-      workspace = await findWorkspaceRoot(externalId);
-    }
+    await gcpFileService.createFolder(folderName, null, externalId, null);
+    const workspace = await findWorkspaceRoot(externalId);
 
     if (!workspace) {
       return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
@@ -1336,6 +1335,20 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
+  if (parseRevisionVersionNumber(cleanPath)) {
+    const existingRevisionFile = await FileMeta.findOne({ path: cleanPath, isFolder: false })
+      .select("_id metadata")
+      .lean();
+    if (existingRevisionFile) {
+      return {
+        ok: false,
+        code: httpStatus.CONFLICT,
+        error: "This version is already uploaded. Ask the client to request a revision before uploading the next version.",
+        filepath: cleanPath,
+      };
+    }
+  }
+
   const result = await gcpFileService.uploadFile(
     `Website_Shoots_Flow/${cleanPath}`.replace(/\/+/g, "/"),
     cleanContentType,
@@ -1385,6 +1398,15 @@ const completeUploadMetadataForFile = async ({
     orderId: parentFolder?.metadata?.orderId || null,
     externalUserId: normalizedUserId,
   };
+  const revisionVersionNumber = parseRevisionVersionNumber(cleanPath);
+  const revisionUploadMetadata = revisionVersionNumber
+    ? {
+        editStatus: "uploaded",
+        currentVersion: revisionVersionNumber,
+        uploadedVersion: revisionVersionNumber,
+        uploadedForVersion: revisionVersionNumber,
+      }
+    : {};
 
   const touchedAt = new Date();
   const existingFile = await FileMeta.findOne({ path: cleanPath });
@@ -1397,6 +1419,7 @@ const completeUploadMetadataForFile = async ({
       ...existingFile.metadata,
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      ...revisionUploadMetadata,
     };
     if (!existingFile.author || existingFile.author === "Unknown") {
       existingFile.author = cleanAuthorName;
@@ -1445,6 +1468,7 @@ const completeUploadMetadataForFile = async ({
     metadata: {
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      ...revisionUploadMetadata,
     },
     createdAt: touchedAt,
     updatedAt: touchedAt,
@@ -1982,6 +2006,344 @@ const processFaceIndexJob = async (job = {}) =>
 const enqueueOrRunFaceScanJob = async (jobId) => {
   await faceScanQueueService.enqueueJob(jobId);
   return "mongo";
+};
+
+exports.copyFiles = async (req, res, next) => {
+  try {
+    const externalId = normalizeExternalId(req.body.externalId);
+    const phase = String(req.body.phase || "root").trim().toLowerCase();
+    const targetPath = String(req.body.targetPath || req.body.path || "").trim();
+    const sourcePaths = Array.isArray(req.body.sourcePaths)
+      ? req.body.sourcePaths.map((item) => normalizeWorkspacePath(item)).filter(Boolean)
+      : [];
+    const normalizedUserId = req.body.userId ? String(req.body.userId).trim() : null;
+    const mongoUserId = toMongoUserIdOrNull(normalizedUserId);
+    const authorName = String(req.body.authorName || "Beige User").trim();
+
+    if (!externalId || !["pre", "post"].includes(phase) || !targetPath || !sourcePaths.length) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "externalId, phase, targetPath and sourcePaths are required",
+      });
+    }
+
+    const workspace = await findWorkspaceRoot(externalId);
+    if (!workspace) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Workspace not found",
+      });
+    }
+
+    const workspaceRoot = normalizeWorkspacePath(workspace.path).replace(/\/$/, "");
+    const destinationFolder = normalizeWorkspacePath(
+      resolveWorkspaceBasePath(workspace.path, phase, targetPath)
+    ).replace(/\/$/, "");
+    const { parentFolder: destinationFolderDoc } = await getParentFolderMetadata(`${destinationFolder}/__copy_target__`);
+
+    if (!destinationFolderDoc) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Destination folder not found",
+      });
+    }
+
+    const limitedSourcePaths = Array.from(new Set(sourcePaths)).slice(0, 250);
+    const results = [];
+
+    await runWithConcurrency(limitedSourcePaths, 4, async (sourcePath) => {
+      try {
+        const cleanSourcePath = normalizeWorkspacePath(sourcePath);
+        if (!cleanSourcePath.startsWith(`${workspaceRoot}/`)) {
+          results.push({
+            sourcePath: cleanSourcePath,
+            success: false,
+            error: "Source file is outside this workspace",
+            code: httpStatus.FORBIDDEN,
+          });
+          return;
+        }
+
+        const sourceDoc = await FileMeta.findOne({
+          path: cleanSourcePath,
+          isFolder: false,
+        }).lean();
+
+        if (!sourceDoc) {
+          results.push({
+            sourcePath: cleanSourcePath,
+            success: false,
+            error: "Source file metadata not found",
+            code: httpStatus.NOT_FOUND,
+          });
+          return;
+        }
+
+        const fileName = sourceDoc.name || cleanSourcePath.split("/").pop();
+        const destinationPath = `${destinationFolder}/${fileName}`;
+        const copyResult = await gcpFileService.copyFile(
+          `Website_Shoots_Flow/${cleanSourcePath}`,
+          `Website_Shoots_Flow/${destinationPath}`
+        );
+        const touchedAt = new Date();
+        const metadata = {
+          ...(sourceDoc.metadata || {}),
+          ...(destinationFolderDoc.metadata || {}),
+          copiedFrom: cleanSourcePath,
+          copiedBy: normalizedUserId,
+          copiedAt: touchedAt.toISOString(),
+          editStatus: destinationFolder.includes("/Selected for Edits")
+            ? "version_pending"
+            : (sourceDoc.metadata || {}).editStatus,
+          currentVersion: destinationFolder.includes("/Selected for Edits")
+            ? 1
+            : (sourceDoc.metadata || {}).currentVersion,
+        };
+
+        const fileDoc = await FileMeta.findOneAndUpdate(
+          { path: destinationPath, isFolder: false },
+          {
+            $set: {
+              name: fileName,
+              userId: mongoUserId || sourceDoc.userId || destinationFolderDoc.userId || null,
+              isFolder: false,
+              contentType: copyResult.contentType || sourceDoc.contentType || "application/octet-stream",
+              size: copyResult.size || sourceDoc.size || 0,
+              isPublic: sourceDoc.isPublic || false,
+              author: authorName || sourceDoc.author || "Beige User",
+              fullPath: `Website_Shoots_Flow/${destinationPath}`,
+              metadata,
+              updatedAt: touchedAt,
+            },
+            $setOnInsert: {
+              createdAt: touchedAt,
+            },
+          },
+          { upsert: true, new: true }
+        );
+
+        await touchFolderHierarchy(destinationPath, touchedAt);
+
+        results.push({
+          sourcePath: cleanSourcePath,
+          destinationPath,
+          success: true,
+          data: {
+            id: fileDoc._id.toString(),
+            path: fileDoc.path,
+            name: fileDoc.name,
+            size: fileDoc.size,
+          },
+        });
+      } catch (error) {
+        results.push({
+          sourcePath,
+          success: false,
+          error: error?.message || "Failed to copy file",
+          code: error?.statusCode || error?.status || httpStatus.INTERNAL_SERVER_ERROR,
+        });
+      }
+    });
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        total: limitedSourcePaths.length,
+        successCount: results.filter((item) => item.success).length,
+        failureCount: results.filter((item) => !item.success).length,
+        targetPath: destinationFolder,
+        items: results,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const parseRevisionVersionNumber = (filePath) => {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const match = normalized.match(/\/Revisions\/Version(\d+)\//i);
+  return match?.[1] ? Number(match[1]) : null;
+};
+
+const createFileMetaForCopiedObject = async ({
+  sourceDoc,
+  destinationPath,
+  copyResult,
+  parentFolder,
+  userId,
+  authorName,
+  metadata,
+}) => {
+  const touchedAt = new Date();
+  const mongoUserId = toMongoUserIdOrNull(userId);
+  const fileName = sourceDoc.name || destinationPath.split("/").pop();
+  const fileDoc = await FileMeta.findOneAndUpdate(
+    { path: destinationPath, isFolder: false },
+    {
+      $set: {
+        name: fileName,
+        userId: mongoUserId || sourceDoc.userId || parentFolder?.userId || null,
+        isFolder: false,
+        contentType: copyResult.contentType || sourceDoc.contentType || "application/octet-stream",
+        size: copyResult.size || sourceDoc.size || 0,
+        isPublic: sourceDoc.isPublic || false,
+        author: authorName || sourceDoc.author || "Beige User",
+        fullPath: `Website_Shoots_Flow/${destinationPath}`,
+        metadata,
+        updatedAt: touchedAt,
+      },
+      $setOnInsert: { createdAt: touchedAt },
+    },
+    { upsert: true, new: true }
+  );
+
+  await touchFolderHierarchy(destinationPath, touchedAt);
+  return fileDoc;
+};
+
+exports.reviewRevisionFile = async (req, res, next) => {
+  try {
+    const externalId = normalizeExternalId(req.body.externalId);
+    const filePath = normalizeWorkspacePath(req.body.filepath || req.body.path);
+    const action = String(req.body.action || "").trim().toLowerCase();
+    const normalizedUserId = req.body.userId ? String(req.body.userId).trim() : null;
+    const authorName = String(req.body.authorName || "Beige User").trim();
+
+    if (!externalId || !filePath || !["approve", "request_revision"].includes(action)) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "externalId, filepath and action are required",
+      });
+    }
+
+    const workspace = await findWorkspaceRoot(externalId);
+    if (!workspace) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Workspace not found",
+      });
+    }
+
+    const workspaceRoot = normalizeWorkspacePath(workspace.path).replace(/\/$/, "");
+    if (!filePath.startsWith(`${workspaceRoot}/`)) {
+      return res.status(httpStatus.FORBIDDEN).json({
+        success: false,
+        message: "File is outside this workspace",
+      });
+    }
+
+    const sourceDoc = await FileMeta.findOne({ path: filePath, isFolder: false });
+    if (!sourceDoc) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "File metadata not found",
+      });
+    }
+
+    const versionNumber = parseRevisionVersionNumber(filePath) || Number(sourceDoc.metadata?.currentVersion || 1);
+    const fileName = sourceDoc.name || filePath.split("/").pop();
+    const touchedAt = new Date();
+
+    if (action === "approve") {
+      const finalFolderPath = `${workspaceRoot}/Post-Production/Final Deliverables`;
+      const { parentFolder: finalFolder } = await getParentFolderMetadata(`${finalFolderPath}/__approved_target__`);
+      if (!finalFolder) {
+        return res.status(httpStatus.NOT_FOUND).json({
+          success: false,
+          message: "Final Deliverables folder not found",
+        });
+      }
+
+      const destinationPath = `${finalFolderPath}/${fileName}`;
+      const copyResult = await gcpFileService.copyFile(
+        `Website_Shoots_Flow/${filePath}`,
+        `Website_Shoots_Flow/${destinationPath}`
+      );
+      const finalDoc = await createFileMetaForCopiedObject({
+        sourceDoc,
+        destinationPath,
+        copyResult,
+        parentFolder: finalFolder,
+        userId: normalizedUserId,
+        authorName,
+        metadata: {
+          ...(sourceDoc.metadata || {}),
+          ...(finalFolder.metadata || {}),
+          approvedFrom: filePath,
+          approvedVersion: versionNumber,
+          approvedBy: normalizedUserId,
+          approvedAt: touchedAt.toISOString(),
+          editStatus: "approved",
+          currentVersion: versionNumber,
+        },
+      });
+
+      sourceDoc.metadata = {
+        ...(sourceDoc.metadata || {}),
+        editStatus: "approved",
+        approvedAt: touchedAt.toISOString(),
+        approvedBy: normalizedUserId,
+      };
+      sourceDoc.updatedAt = touchedAt;
+      await sourceDoc.save();
+
+      return res.status(httpStatus.OK).json({
+        success: true,
+        data: {
+          action,
+          versionNumber,
+          finalDeliverable: {
+            id: finalDoc._id.toString(),
+            path: finalDoc.path,
+            name: finalDoc.name,
+          },
+        },
+      });
+    }
+
+    const nextVersionNumber = versionNumber + 1;
+    const revisionsPath = `${workspaceRoot}/Post-Production/Edits/Revisions`;
+    const { parentFolder: revisionsFolder } = await getParentFolderMetadata(`${revisionsPath}/__revision_target__`);
+    if (!revisionsFolder) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Revisions folder not found",
+      });
+    }
+
+    await ensurePostProductionFolder({
+      parentPath: `${revisionsPath}/`,
+      parentFolderId: revisionsFolder._id,
+      folderName: `Version${nextVersionNumber}`,
+      folderType: "postproduction_edited_footage",
+      cpIds: revisionsFolder.metadata?.cpIds || [],
+      orderId: revisionsFolder.metadata?.orderId || externalId,
+      userId: revisionsFolder.userId || null,
+    });
+
+    sourceDoc.metadata = {
+      ...(sourceDoc.metadata || {}),
+      editStatus: "revision_requested",
+      revisionRequestedAt: touchedAt.toISOString(),
+      revisionRequestedBy: normalizedUserId,
+      requestedNextVersion: nextVersionNumber,
+    };
+    sourceDoc.updatedAt = touchedAt;
+    await sourceDoc.save();
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        action,
+        versionNumber,
+        nextVersionNumber,
+        nextVersionPath: `${revisionsPath}/Version${nextVersionNumber}`,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
 };
 
 exports.createFaceScanJob = async (req, res, next) => {
