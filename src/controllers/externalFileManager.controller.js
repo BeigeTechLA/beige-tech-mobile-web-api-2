@@ -1,7 +1,8 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta, FaceEmbedding, Order, Booking } = require("../models");
+const { FileMeta, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
+const faceScanQueueService = require("../services/faceScanQueue.service");
 const { ensurePostProductionFolder } = gcpFileService;
 const sendgridService = require("../services/sendgrid.service");
 const {
@@ -36,6 +37,14 @@ const FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX = Math.max(
   Number(process.env.FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX || 100)
 );
 const FACE_SCAN_INDEX_CONCURRENCY = Math.max(1, Number(process.env.FACE_SCAN_INDEX_CONCURRENCY || 3));
+const FACE_SCAN_PROVIDER_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.FACE_SCAN_PROVIDER_CONCURRENCY || 1)
+);
+const FACE_SCAN_PROVIDER_QUEUE_LIMIT = Math.max(
+  1,
+  Number(process.env.FACE_SCAN_PROVIDER_QUEUE_LIMIT || 50)
+);
 const FACE_SCAN_REINDEX_CANDIDATE_LIMIT_MAX = Math.max(
   100,
   Number(process.env.FACE_SCAN_REINDEX_CANDIDATE_LIMIT_MAX || 1200)
@@ -56,6 +65,27 @@ const FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY = Math.max(
   1,
   Number(process.env.FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY || 2)
 );
+const FACE_SCAN_JOB_STALE_PROCESSING_MS = Math.max(
+  60000,
+  Number(process.env.FACE_SCAN_JOB_STALE_PROCESSING_MS || 15 * 60 * 1000)
+);
+const FACE_SCAN_QUERY_UPLOAD_PREFIX = String(
+  process.env.FACE_SCAN_QUERY_UPLOAD_PREFIX || "_face_scan_queries"
+)
+  .trim()
+  .replace(/^\/+|\/+$/g, "");
+const FACE_SCAN_QUERY_IMAGE_MAX_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.FACE_SCAN_QUERY_IMAGE_MAX_BYTES || 8 * 1024 * 1024)
+);
+const FACE_SCAN_MAX_RESULTS_LIMIT = Math.max(
+  50,
+  Number(process.env.FACE_SCAN_MAX_RESULTS_LIMIT || 500)
+);
+const FACE_SCAN_INDEXED_SEARCH_BATCH_SIZE = Math.max(
+  10,
+  Number(process.env.FACE_SCAN_INDEXED_SEARCH_BATCH_SIZE || 100)
+);
 const ENABLE_UPLOAD_FACE_INDEXING =
   String(process.env.ENABLE_UPLOAD_FACE_INDEXING || "false").toLowerCase() === "true";
 const FACE_SCAN_UPLOAD_INDEX_CONCURRENCY = Math.max(
@@ -71,6 +101,8 @@ const PARENT_FOLDER_CACHE_TTL_MS = Math.max(
   Number(process.env.PARENT_FOLDER_CACHE_TTL_MS || 30000)
 );
 const parentFolderMetaCache = new Map();
+let activeFaceProviderRequests = 0;
+const faceProviderRequestQueue = [];
 
 const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
@@ -86,6 +118,16 @@ const isImageLikeFile = (file = {}) => {
   const contentType = String(file.contentType || file.mimeType || "").toLowerCase();
   if (contentType.startsWith("image/")) return true;
   return isImageLikePath(file.path || file.name || "");
+};
+
+const getImageExtensionForContentType = (contentType = "") => {
+  const normalized = String(contentType || "").toLowerCase();
+  if (normalized.includes("png")) return "png";
+  if (normalized.includes("webp")) return "webp";
+  if (normalized.includes("heic")) return "heic";
+  if (normalized.includes("heif")) return "heif";
+  if (normalized.includes("bmp")) return "bmp";
+  return "jpg";
 };
 
 const toPositiveInteger = (value, fallback) => {
@@ -159,40 +201,74 @@ const getBestFacePairScore = (queryEmbeddings = [], candidateEmbeddings = []) =>
   };
 };
 
-const fetchFaceServicePayload = async (path, payload = {}, timeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS) => {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+const runWithFaceProviderSlot = async (task) => {
+  await new Promise((resolve, reject) => {
+    const start = () => {
+      activeFaceProviderRequests += 1;
+      resolve();
+    };
+
+    if (activeFaceProviderRequests < FACE_SCAN_PROVIDER_CONCURRENCY) {
+      start();
+      return;
+    }
+
+    if (faceProviderRequestQueue.length >= FACE_SCAN_PROVIDER_QUEUE_LIMIT) {
+      const error = new Error("Face scan provider is busy; please retry shortly");
+      error.status = httpStatus.TOO_MANY_REQUESTS;
+      error.statusCode = httpStatus.TOO_MANY_REQUESTS;
+      reject(error);
+      return;
+    }
+
+    faceProviderRequestQueue.push(start);
+  });
 
   try {
-    const response = await fetch(`${FACE_SCAN_SERVICE_URL.replace(/\/+$/, "")}${path}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-      body: JSON.stringify(payload),
-    });
-
-    const responsePayload = await response.json().catch(() => null);
-    if (!response.ok) {
-      const error = new Error(
-        responsePayload?.detail || responsePayload?.message || "Face scan provider request failed"
-      );
-      error.status = response.status;
-      throw error;
-    }
-
-    return responsePayload;
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      const timeoutError = new Error(`Face scan provider timed out after ${timeoutMs}ms`);
-      timeoutError.status = httpStatus.GATEWAY_TIMEOUT;
-      throw timeoutError;
-    }
-    throw error;
+    return await task();
   } finally {
-    clearTimeout(timeout);
+    activeFaceProviderRequests = Math.max(0, activeFaceProviderRequests - 1);
+    const next = faceProviderRequestQueue.shift();
+    if (next) next();
   }
+};
+
+const fetchFaceServicePayload = async (path, payload = {}, timeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS) => {
+  return runWithFaceProviderSlot(async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(`${FACE_SCAN_SERVICE_URL.replace(/\/+$/, "")}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+        body: JSON.stringify(payload),
+      });
+
+      const responsePayload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const error = new Error(
+          responsePayload?.detail || responsePayload?.message || "Face scan provider request failed"
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      return responsePayload;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const timeoutError = new Error(`Face scan provider timed out after ${timeoutMs}ms`);
+        timeoutError.status = httpStatus.GATEWAY_TIMEOUT;
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
 };
 
 const isNoFaceDetectedError = (error) => {
@@ -793,58 +869,36 @@ const sendFileUploadTemplateEmail = async ({
   }
 };
 
-const uploadFaceIndexQueue = [];
-let uploadFaceIndexActiveCount = 0;
-
-const processUploadFaceIndexQueue = () => {
-  if (!ENABLE_UPLOAD_FACE_INDEXING) return;
-
-  while (
-    uploadFaceIndexActiveCount < FACE_SCAN_UPLOAD_INDEX_CONCURRENCY &&
-    uploadFaceIndexQueue.length > 0
-  ) {
-    const job = uploadFaceIndexQueue.shift();
-    if (!job) break;
-    uploadFaceIndexActiveCount += 1;
-
-    void indexEmbeddingForCandidate(job)
-      .catch((error) => {
-        console.warn("[face-index] upload-index-queue-failed", {
-          externalId: job?.externalId,
-          filepath: job?.filepath,
-          reason: error?.message || "unknown",
-        });
-      })
-      .finally(() => {
-        uploadFaceIndexActiveCount = Math.max(0, uploadFaceIndexActiveCount - 1);
-        setImmediate(processUploadFaceIndexQueue);
-      });
-  }
-};
-
-const enqueueUploadFaceIndexJob = (job) => {
-  if (!ENABLE_UPLOAD_FACE_INDEXING) return;
+const enqueueUploadFaceIndexJob = (job, options = {}) => {
+  if (!ENABLE_UPLOAD_FACE_INDEXING && !options.force) return;
   if (!job?.externalId || !job?.filepath) return;
 
-  if (uploadFaceIndexQueue.length >= FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT) {
-    console.warn("[face-index] upload-index-queue-overflow", {
-      queueLength: uploadFaceIndexQueue.length,
-      limit: FACE_SCAN_UPLOAD_INDEX_QUEUE_LIMIT,
-      externalId: job.externalId,
-      filepath: job.filepath,
-    });
-    return;
-  }
+  const queueJob = {
+    ...job,
+    forceIndex: !!options.force,
+  };
 
-  uploadFaceIndexQueue.push(job);
-  processUploadFaceIndexQueue();
+  void faceScanQueueService.enqueueIndexJob(queueJob)
+    .then((queued) => {
+      if (queued) return;
+      console.warn("[face-index] mongo-index-enqueue-skipped", {
+        externalId: job.externalId,
+        filepath: job.filepath,
+      });
+    })
+    .catch((error) => {
+      console.warn("[face-index] mongo-index-enqueue-failed", {
+        externalId: job.externalId,
+        filepath: job.filepath,
+        reason: error?.message || "unknown",
+      });
+    });
 };
 
 const scheduleBackgroundReindex = ({
   externalId,
   candidates = [],
   candidateLimit = FACE_SCAN_BACKGROUND_REINDEX_BATCH,
-  concurrency = FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY,
   providerTimeoutMs = FACE_SCAN_PROVIDER_TIMEOUT_MS,
 }) => {
   const selected = (Array.isArray(candidates) ? candidates : []).slice(
@@ -853,19 +907,17 @@ const scheduleBackgroundReindex = ({
   );
   if (!selected.length) return 0;
 
-  void runWithConcurrency(selected, concurrency, async (candidate) => {
-    await indexEmbeddingForCandidate({
-      externalId,
-      filepath: candidate.path,
-      fileName: candidate.name,
-      contentType: candidate.contentType,
-      providerTimeoutMs,
-    });
-  }).catch((error) => {
-    console.warn("[face-index] background-reindex-failed", {
-      externalId,
-      reason: error?.message || "unknown",
-    });
+  selected.forEach((candidate) => {
+    enqueueUploadFaceIndexJob(
+      {
+        externalId,
+        filepath: candidate.path,
+        fileName: candidate.name,
+        contentType: candidate.contentType,
+        providerTimeoutMs,
+      },
+      { force: true }
+    );
   });
 
   return selected.length;
@@ -1477,6 +1529,58 @@ exports.getUploadPolicy = async (req, res, next) => {
   }
 };
 
+exports.getFaceScanQueryUploadPolicy = async (req, res, next) => {
+  try {
+    const cleanContentType = String(req.body.fileContentType || "").trim().toLowerCase();
+    const normalizedFileSize = Number(req.body.fileSize || 0);
+
+    if (!cleanContentType.startsWith("image/") || !normalizedFileSize) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "Valid image fileContentType and fileSize are required",
+      });
+    }
+
+    if (normalizedFileSize > FACE_SCAN_QUERY_IMAGE_MAX_BYTES) {
+      return res.status(413).json({
+        success: false,
+        message: "Face scan query image is too large",
+      });
+    }
+
+    const externalId = normalizeExternalId(req.body.externalId || req.body.eventExternalId || "unknown");
+    const safeExternalId = externalId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "unknown";
+    const now = new Date();
+    const datePrefix = now.toISOString().slice(0, 10);
+    const extension = getImageExtensionForContentType(cleanContentType);
+    const objectId = new mongoose.Types.ObjectId().toString();
+    const scanImagePath = `${FACE_SCAN_QUERY_UPLOAD_PREFIX}/${datePrefix}/${safeExternalId}-${Date.now()}-${objectId}.${extension}`;
+    const storagePath = `Website_Shoots_Flow/${scanImagePath}`.replace(/\/+/g, "/");
+
+    const result = await gcpFileService.uploadFile(
+      storagePath,
+      cleanContentType,
+      normalizedFileSize,
+      req.body.userId || null,
+      {
+        purpose: "face-scan-query",
+        externalId: safeExternalId,
+      }
+    );
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        ...result,
+        scanImagePath,
+        filePath: result?.filePath || storagePath,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.getUploadPoliciesBatch = async (req, res, next) => {
   try {
     const items = Array.isArray(req.body.items) ? req.body.items : [];
@@ -1628,6 +1732,280 @@ exports.completeUploadsBatch = async (req, res, next) => {
   } catch (error) {
     return next(error);
   }
+};
+
+const createFaceScanError = (status, message) => {
+  const error = new Error(message);
+  error.status = status;
+  error.statusCode = status;
+  return error;
+};
+
+const runFaceMatchSearch = async (payload = {}) => {
+  const externalId = normalizeExternalId(payload.externalId || payload.eventExternalId);
+  const scanImageBase64 = String(payload.scanImageBase64 || "").trim();
+  const scanImagePath = normalizeWorkspacePath(payload.scanImagePath || "");
+  let scanImageUrl = String(payload.scanImageUrl || "").trim();
+  const threshold = Math.max(0, Math.min(1, Number(payload.threshold || 0.7)));
+  const maxResults = Math.min(
+    toPositiveInteger(payload.maxResults, 200),
+    FACE_SCAN_MAX_RESULTS_LIMIT
+  );
+  const minScore = Math.max(0, Math.min(1, Number(payload.minScore ?? threshold)));
+  const providerTimeoutMs = resolveProviderTimeoutMs(payload.providerTimeoutMs);
+
+  if (!externalId) {
+    throw createFaceScanError(httpStatus.BAD_REQUEST, "externalId is required");
+  }
+
+  if (!scanImageBase64 && !scanImageUrl && scanImagePath) {
+    scanImageUrl = await getFileSignedViewUrl(scanImagePath);
+  }
+
+  if (!scanImageBase64 && !scanImageUrl) {
+    throw createFaceScanError(httpStatus.BAD_REQUEST, "scanImageBase64, scanImageUrl or scanImagePath is required");
+  }
+
+  const allCandidates = await listWorkspaceImageCandidates(externalId);
+  const candidatePathSet = new Set(
+    allCandidates.map((candidate) => normalizeWorkspacePath(candidate?.path)).filter(Boolean)
+  );
+  const candidatePaths = Array.from(candidatePathSet);
+  const indexedMatches = [];
+  const indexedPathSet = new Set();
+
+  if (candidatePaths.length) {
+    const indexedPathCursor = FaceEmbedding.find({
+      externalId,
+      filepath: { $in: candidatePaths },
+      status: "ready",
+    })
+      .select("filepath")
+      .lean()
+      .cursor({ batchSize: FACE_SCAN_INDEXED_SEARCH_BATCH_SIZE });
+
+    for await (const row of indexedPathCursor) {
+      const normalizedPath = normalizeWorkspacePath(row?.filepath);
+      if (normalizedPath && candidatePathSet.has(normalizedPath)) {
+        indexedPathSet.add(String(row.filepath || "").trim());
+      }
+    }
+  }
+
+  const indexedCandidatesCount = indexedPathSet.size;
+  const nonReadyRows = await FaceEmbedding.find({
+    externalId,
+    filepath: { $in: candidatePaths },
+    status: { $in: ["failed", "skipped"] },
+  })
+    .select("filepath status retryCount errorCode")
+    .lean();
+  const blockedLivePathSet = new Set(
+    nonReadyRows
+      .filter((row) => {
+        const status = String(row?.status || "");
+        const errorCode = String(row?.errorCode || "").toLowerCase();
+        if (status === "skipped") {
+          return errorCode === "no_face" || errorCode === "not_image_or_invalid";
+        }
+        return false;
+      })
+      .map((row) => String(row?.filepath || "").trim())
+      .filter(Boolean)
+  );
+
+  if (indexedCandidatesCount) {
+    try {
+      const queryEmbeddings = await fetchEmbeddingsForImage({
+        scanImageBase64,
+        scanImageUrl,
+        providerTimeoutMs,
+      });
+
+      const indexedMatchLimit = Math.max(maxResults * 3, 100);
+      const indexedCursor = FaceEmbedding.find({
+        externalId,
+        filepath: { $in: candidatePaths },
+        status: "ready",
+      })
+        .select("filepath fileName embeddings facesCount")
+        .sort({ updatedAt: -1 })
+        .lean()
+        .cursor({ batchSize: FACE_SCAN_INDEXED_SEARCH_BATCH_SIZE });
+
+      for await (const row of indexedCursor) {
+        const normalizedPath = normalizeWorkspacePath(row?.filepath);
+        if (!normalizedPath || !candidatePathSet.has(normalizedPath)) continue;
+        const candidateEmbeddings = Array.isArray(row.embeddings) ? row.embeddings : [];
+        if (!candidateEmbeddings.length) continue;
+        const { score, queryFaceIndex, candidateFaceIndex } = getBestFacePairScore(
+          queryEmbeddings,
+          candidateEmbeddings
+        );
+        if (score < threshold) continue;
+        indexedMatches.push({
+          path: row.filepath,
+          name: row.fileName || "",
+          score,
+          confidence: score,
+          queryFaceIndex,
+          candidateFaceIndex,
+          queryFacesDetected: queryEmbeddings.length,
+          candidateFacesDetected: candidateEmbeddings.length,
+        });
+
+        if (indexedMatches.length > indexedMatchLimit) {
+          indexedMatches.sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+          indexedMatches.length = indexedMatchLimit;
+        }
+      }
+    } catch (error) {
+      if (!isNoFaceDetectedError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  const hasIndexedData = indexedCandidatesCount > 0;
+  const liveCandidatesBase = hasIndexedData
+    ? allCandidates.filter((candidate) => !indexedPathSet.has(String(candidate.path || "").trim()))
+    : allCandidates;
+  const liveCandidates = liveCandidatesBase.filter(
+    (candidate) => !blockedLivePathSet.has(String(candidate.path || "").trim())
+  );
+
+  const requestedLiveCandidateLimit = hasIndexedData
+    ? toPositiveInteger(payload.fallbackCandidateLimit, FACE_SCAN_FALLBACK_MAX_CANDIDATES)
+    : toPositiveInteger(payload.candidateLimit, FACE_SCAN_MAX_CANDIDATES);
+  const liveCandidateLimit = Math.min(requestedLiveCandidateLimit, FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX);
+
+  const backgroundReindexEnabled = payload.backgroundReindex !== false;
+  const queuedForBackgroundIndex = backgroundReindexEnabled
+    ? scheduleBackgroundReindex({
+        externalId,
+        candidates: liveCandidates,
+        candidateLimit: toPositiveInteger(
+          payload.backgroundBatchLimit,
+          FACE_SCAN_BACKGROUND_REINDEX_BATCH
+        ),
+        concurrency: toPositiveInteger(
+          payload.backgroundConcurrency,
+          FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY
+        ),
+        providerTimeoutMs,
+      })
+    : 0;
+
+  let liveSearchResult = {
+    scannedCandidatesCount: 0,
+    matches: [],
+    provider: "deepface",
+  };
+  const hasIndexedMatches = indexedMatches.length > 0;
+  const shouldRunLiveFallback = payload.includeLiveFallback === true || !hasIndexedMatches;
+  let noFaceDetectedInScanImage = false;
+  if (shouldRunLiveFallback) {
+    try {
+      liveSearchResult = await runProviderFaceSearch({
+        externalId,
+        scanImageBase64,
+        scanImageUrl,
+        threshold,
+        maxResults,
+        providerTimeoutMs,
+        candidates: liveCandidates.slice(0, liveCandidateLimit),
+      });
+    } catch (error) {
+      if (isNoFaceDetectedError(error)) {
+        noFaceDetectedInScanImage = true;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  const mergedMatches = mergeFaceMatchesByBestScore([
+    ...indexedMatches,
+    ...(liveSearchResult.matches || []),
+  ])
+    .filter((item) => Number(item?.score || item?.confidence || 0) >= minScore)
+    .slice(0, maxResults);
+  const scanMode = hasIndexedData ? "indexed_plus_fallback_scan" : "full_face_scan";
+  const provider = hasIndexedData
+    ? `deepface-indexed+${liveSearchResult.provider || "deepface"}`
+    : liveSearchResult.provider || "deepface";
+  const workspaceIndexStatus = await getWorkspaceFaceIndexSummary(externalId, allCandidates);
+
+  return {
+    externalId,
+    scanMode,
+    integrated: true,
+    candidatesCount: allCandidates.length,
+    indexedCandidatesCount,
+    scannedCandidatesCount:
+      (hasIndexedData ? indexedCandidatesCount : 0) +
+      liveSearchResult.scannedCandidatesCount,
+    liveFallbackTriggered: shouldRunLiveFallback,
+    backgroundIndexQueued: queuedForBackgroundIndex,
+    noFaceDetectedInScanImage,
+    minScore,
+    indexStatus: workspaceIndexStatus,
+    matches: mergedMatches,
+    provider,
+  };
+};
+
+const processFaceScanJob = async (jobOrId) => {
+  const claimedJob =
+    jobOrId && typeof jobOrId === "object" && jobOrId._id ? jobOrId : null;
+  const job = claimedJob || (await FaceScanJob.findById(jobOrId));
+  if (!job || job.status === "completed") return null;
+
+  if (!claimedJob) {
+    if (
+      job.status === "processing" &&
+      job.startedAt &&
+      Date.now() - new Date(job.startedAt).getTime() < FACE_SCAN_JOB_STALE_PROCESSING_MS
+    ) {
+      return null;
+    }
+
+    job.status = "processing";
+    job.startedAt = new Date();
+    job.attempts = Math.max(0, Number(job.attempts || 0)) + 1;
+    job.errorMessage = null;
+    await job.save();
+  }
+
+  try {
+    const result = await runFaceMatchSearch(job.request || {});
+    job.status = "completed";
+    job.result = result;
+    job.completedAt = new Date();
+    job.errorMessage = null;
+    await job.save();
+    return result;
+  } catch (error) {
+    job.status = "failed";
+    job.errorMessage = error?.message || "Face scan failed";
+    job.completedAt = new Date();
+    await job.save();
+    throw error;
+  }
+};
+
+const processFaceIndexJob = async (job = {}) =>
+  indexEmbeddingForCandidate({
+    externalId: job.externalId,
+    filepath: job.filepath,
+    fileName: job.fileName || "",
+    contentType: job.contentType || "",
+    providerTimeoutMs: resolveProviderTimeoutMs(job.providerTimeoutMs),
+  });
+
+const enqueueOrRunFaceScanJob = async (jobId) => {
+  await faceScanQueueService.enqueueJob(jobId);
+  return "mongo";
 };
 
 exports.copyFiles = async (req, res, next) => {
@@ -1968,15 +2346,12 @@ exports.reviewRevisionFile = async (req, res, next) => {
   }
 };
 
-exports.searchFaceMatches = async (req, res, next) => {
+exports.createFaceScanJob = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId || req.body.eventExternalId);
     const scanImageBase64 = String(req.body.scanImageBase64 || "").trim();
     const scanImageUrl = String(req.body.scanImageUrl || "").trim();
-    const threshold = Math.max(0, Math.min(1, Number(req.body.threshold || 0.7)));
-    const maxResults = toPositiveInteger(req.body.maxResults, 200);
-    const minScore = Math.max(0, Math.min(1, Number(req.body.minScore ?? threshold)));
-    const providerTimeoutMs = resolveProviderTimeoutMs(req.body.providerTimeoutMs);
+    const scanImagePath = normalizeWorkspacePath(req.body.scanImagePath || "");
 
     if (!externalId) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -1985,184 +2360,135 @@ exports.searchFaceMatches = async (req, res, next) => {
       });
     }
 
-    if (!scanImageBase64 && !scanImageUrl) {
+    if (!scanImageBase64 && !scanImageUrl && !scanImagePath) {
       return res.status(httpStatus.BAD_REQUEST).json({
         success: false,
-        message: "scanImageBase64 or scanImageUrl is required",
+        message: "scanImageBase64, scanImageUrl or scanImagePath is required",
       });
     }
 
-    const allCandidates = await listWorkspaceImageCandidates(externalId);
-    const candidatePathSet = new Set(
-      allCandidates.map((candidate) => normalizeWorkspacePath(candidate?.path)).filter(Boolean)
-    );
-    const indexedRows = await FaceEmbedding.find({
+    const job = await FaceScanJob.create({
       externalId,
-      status: "ready",
-    })
-      .select("filepath fileName embeddings facesCount")
-      .sort({ updatedAt: -1 })
-      .lean();
-    const indexedRowsInWorkspace = indexedRows.filter((row) =>
-      candidatePathSet.has(normalizeWorkspacePath(row?.filepath))
-    );
-
-    const indexedMatches = [];
-    const indexedPathSet = new Set(
-      indexedRowsInWorkspace.map((row) => String(row.filepath || "").trim()).filter(Boolean)
-    );
-    const nonReadyRows = await FaceEmbedding.find({
-      externalId,
-      filepath: { $in: Array.from(candidatePathSet) },
-      status: { $in: ["failed", "skipped"] },
-    })
-      .select("filepath status retryCount errorCode")
-      .lean();
-    const blockedLivePathSet = new Set(
-      nonReadyRows
-        .filter((row) => {
-          const status = String(row?.status || "");
-          const errorCode = String(row?.errorCode || "").toLowerCase();
-          if (status === "skipped") {
-            return errorCode === "no_face" || errorCode === "not_image_or_invalid";
-          }
-          return false;
-        })
-        .map((row) => String(row?.filepath || "").trim())
-        .filter(Boolean)
-    );
-
-    if (indexedRowsInWorkspace.length) {
-      try {
-        const queryEmbeddings = await fetchEmbeddingsForImage({
-          scanImageBase64,
-          scanImageUrl,
-          providerTimeoutMs,
-        });
-
-        indexedRowsInWorkspace.forEach((row) => {
-          const candidateEmbeddings = Array.isArray(row.embeddings) ? row.embeddings : [];
-          if (!candidateEmbeddings.length) return;
-          const { score, queryFaceIndex, candidateFaceIndex } = getBestFacePairScore(
-            queryEmbeddings,
-            candidateEmbeddings
-          );
-          if (score < threshold) return;
-          indexedMatches.push({
-            path: row.filepath,
-            name: row.fileName || "",
-            score,
-            confidence: score,
-            queryFaceIndex,
-            candidateFaceIndex,
-            queryFacesDetected: queryEmbeddings.length,
-            candidateFacesDetected: candidateEmbeddings.length,
-          });
-        });
-      } catch (error) {
-        if (isNoFaceDetectedError(error)) {
-          // We'll still try live scan branch below, and if provider also returns no-face we respond gracefully.
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    const hasIndexedData = indexedRowsInWorkspace.length > 0;
-    const liveCandidatesBase = hasIndexedData
-      ? allCandidates.filter((candidate) => !indexedPathSet.has(String(candidate.path || "").trim()))
-      : allCandidates;
-    const liveCandidates = liveCandidatesBase.filter(
-      (candidate) => !blockedLivePathSet.has(String(candidate.path || "").trim())
-    );
-
-    const requestedLiveCandidateLimit = hasIndexedData
-      ? toPositiveInteger(req.body.fallbackCandidateLimit, FACE_SCAN_FALLBACK_MAX_CANDIDATES)
-      : toPositiveInteger(req.body.candidateLimit, FACE_SCAN_MAX_CANDIDATES);
-    const liveCandidateLimit = Math.min(requestedLiveCandidateLimit, FACE_SCAN_LIVE_CANDIDATE_LIMIT_MAX);
-
-    const backgroundReindexEnabled = req.body.backgroundReindex !== false;
-    const queuedForBackgroundIndex = backgroundReindexEnabled
-      ? scheduleBackgroundReindex({
-          externalId,
-          candidates: liveCandidates,
-          candidateLimit: toPositiveInteger(
-            req.body.backgroundBatchLimit,
-            FACE_SCAN_BACKGROUND_REINDEX_BATCH
-          ),
-          concurrency: toPositiveInteger(
-            req.body.backgroundConcurrency,
-            FACE_SCAN_BACKGROUND_REINDEX_CONCURRENCY
-          ),
-          providerTimeoutMs,
-        })
-      : 0;
-
-    let liveSearchResult = {
-      scannedCandidatesCount: 0,
-      matches: [],
-      provider: "deepface",
-    };
-    const hasIndexedMatches = indexedMatches.length > 0;
-    const shouldRunLiveFallback = req.body.includeLiveFallback === true || !hasIndexedMatches;
-    let noFaceDetectedInScanImage = false;
-    if (shouldRunLiveFallback) {
-      try {
-        liveSearchResult = await runProviderFaceSearch({
-          externalId,
-          scanImageBase64,
-          scanImageUrl,
-          threshold,
-          maxResults,
-          providerTimeoutMs,
-          candidates: liveCandidates.slice(0, liveCandidateLimit),
-        });
-      } catch (error) {
-        if (isNoFaceDetectedError(error)) {
-          noFaceDetectedInScanImage = true;
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    const mergedMatches = mergeFaceMatchesByBestScore([
-      ...indexedMatches,
-      ...(liveSearchResult.matches || []),
-    ])
-      .filter((item) => Number(item?.score || item?.confidence || 0) >= minScore)
-      .slice(0, maxResults);
-    const scanMode = hasIndexedData ? "indexed_plus_fallback_scan" : "full_face_scan";
-    const provider = hasIndexedData
-      ? `deepface-indexed+${liveSearchResult.provider || "deepface"}`
-      : liveSearchResult.provider || "deepface";
-    const workspaceIndexStatus = await getWorkspaceFaceIndexSummary(externalId, allCandidates);
-
-    return res.status(httpStatus.OK).json({
-      success: true,
-      message: "Face scan completed",
-      data: {
+      status: "queued",
+      request: {
         externalId,
-        scanMode,
-        integrated: true,
-        candidatesCount: allCandidates.length,
-        indexedCandidatesCount: indexedRowsInWorkspace.length,
-        scannedCandidatesCount:
-          (hasIndexedData ? indexedRowsInWorkspace.length : 0) +
-          liveSearchResult.scannedCandidatesCount,
-        liveFallbackTriggered: shouldRunLiveFallback,
-        backgroundIndexQueued: queuedForBackgroundIndex,
-        noFaceDetectedInScanImage,
-        minScore,
-        indexStatus: workspaceIndexStatus,
-        matches: mergedMatches,
-        provider,
+        scanImageBase64: scanImagePath ? undefined : scanImageBase64 || undefined,
+        scanImageUrl: scanImageUrl || undefined,
+        scanImagePath: scanImagePath || undefined,
+        threshold: req.body.threshold,
+        minScore: req.body.minScore,
+        maxResults: req.body.maxResults,
+        candidateLimit: req.body.candidateLimit,
+        fallbackCandidateLimit: req.body.fallbackCandidateLimit,
+        backgroundReindex: req.body.backgroundReindex,
+        backgroundBatchLimit: req.body.backgroundBatchLimit,
+        backgroundConcurrency: req.body.backgroundConcurrency,
+        includeLiveFallback: req.body.includeLiveFallback,
+        providerTimeoutMs: req.body.providerTimeoutMs,
+      },
+    });
+
+    const queueMode = await enqueueOrRunFaceScanJob(job.id);
+
+    return res.status(httpStatus.ACCEPTED).json({
+      success: true,
+      message: "Face scan job queued",
+      data: {
+        jobId: job.id,
+        externalId,
+        status: job.status,
+        queueMode,
       },
     });
   } catch (error) {
     return next(error);
   }
 };
+
+exports.getFaceScanJob = async (req, res, next) => {
+  try {
+    const job = await FaceScanJob.findById(req.params.jobId).lean();
+    if (!job) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Face scan job not found",
+      });
+    }
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        jobId: String(job._id),
+        externalId: job.externalId,
+        status: job.status,
+        result: job.result || null,
+        errorMessage: job.errorMessage || null,
+        attempts: job.attempts || 0,
+        queuedAt: job.queuedAt,
+        startedAt: job.startedAt,
+        completedAt: job.completedAt,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.getFaceScanQueueStatus = async (req, res, next) => {
+  try {
+    const queueStats = await faceScanQueueService.getQueueStats().catch((error) => ({
+      configured: faceScanQueueService.isConfigured(),
+      scanJobs: null,
+      indexJobs: null,
+      error: error?.message || "Failed to read queue stats",
+    }));
+    const recentCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [queuedJobs, processingJobs, failedJobs24h, completedJobs24h] = await Promise.all([
+      FaceScanJob.countDocuments({ status: "queued" }),
+      FaceScanJob.countDocuments({ status: "processing" }),
+      FaceScanJob.countDocuments({ status: "failed", updatedAt: { $gte: recentCutoff } }),
+      FaceScanJob.countDocuments({ status: "completed", updatedAt: { $gte: recentCutoff } }),
+    ]);
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      message: "Face scan queue status fetched",
+      data: {
+        queue: queueStats,
+        scanJobs: {
+          queued: queuedJobs,
+          processing: processingJobs,
+          failedLast24h: failedJobs24h,
+          completedLast24h: completedJobs24h,
+        },
+        provider: {
+          activeRequests: activeFaceProviderRequests,
+          waitingRequests: faceProviderRequestQueue.length,
+          maxConcurrency: FACE_SCAN_PROVIDER_CONCURRENCY,
+          queueLimit: FACE_SCAN_PROVIDER_QUEUE_LIMIT,
+        },
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.searchFaceMatches = async (req, res, next) => {
+  try {
+    const data = await runFaceMatchSearch(req.body || {});
+    return res.status(httpStatus.OK).json({
+      success: true,
+      message: "Face scan completed",
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.processFaceScanJob = processFaceScanJob;
+exports.processFaceIndexJob = processFaceIndexJob;
 
 exports.getFaceScanIndexStatus = async (req, res, next) => {
   try {
