@@ -111,7 +111,7 @@ router.get("/order/:orderId", chatController.getChatRoomByOrderId);
 router.get("/room/:roomId", chatController.getChatRoomById);
 router.post("/participants/:roomId", async (req, res) => {
   try {
-    const { role, participants, user_ids } = req.body;
+    const { role, participants, user_ids, silent } = req.body;
     if (!role) {
       return res.status(400).send({
         success: false,
@@ -121,7 +121,7 @@ router.post("/participants/:roomId", async (req, res) => {
 
     const result = await chatService.addParticipants(
       req.params.roomId,
-      { role, participants, user_ids },
+      { role, participants, user_ids, silent: silent === true },
       req.body.adminUser?.id || req.body.adminId || "beige-admin",
       req.body.adminUser?.name || "Beige Admin"
     );
