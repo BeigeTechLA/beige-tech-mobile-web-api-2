@@ -349,6 +349,7 @@ const listWorkspaceContents = async (basePath) => {
       files.push({
         id: doc._id.toString(),
         name: doc.name,
+        author: doc.author || "Unknown",
         path: doc.path,
         fullPath: doc.fullPath,
         size: doc.size || 0,
@@ -1421,9 +1422,8 @@ const completeUploadMetadataForFile = async ({
       orderId: folderMetadata.orderId,
       ...revisionUploadMetadata,
     };
-    if (!existingFile.author || existingFile.author === "Unknown") {
-      existingFile.author = cleanAuthorName;
-    }
+    // A file replaced at the same path belongs to the latest completed upload.
+    existingFile.author = cleanAuthorName;
     await existingFile.save();
     await touchFolderHierarchy(cleanPath, touchedAt);
 
