@@ -68,6 +68,25 @@ const UPLOAD_FOLDER_METADATA_CACHE_TTL_MS = Math.max(
   Number(process.env.UPLOAD_FOLDER_METADATA_CACHE_TTL_MS || 120000)
 );
 const uploadFolderMetadataCache = new Map();
+const POST_PRODUCTION_SUBFOLDERS = [
+  {
+    name: 'Raw Footage',
+    folderType: 'postproduction_raw_footage',
+    children: []
+  },
+  {
+    name: 'Edits',
+    folderType: 'postproduction_edited_footage',
+    children: ['Selected for Edits', 'Revisions']
+  },
+  {
+    name: 'Final Deliverables',
+    folderType: 'postproduction_final_deliverables',
+    children: []
+  }
+];
+const LEGACY_EDIT_FOLDER_NAMES = ['Edited Footage'];
+const EDIT_FOLDER_NAMES = ['Edits', ...LEGACY_EDIT_FOLDER_NAMES];
 
 // let CDN_ADMINS = [process.env.CDN_ADMIN];
 let CDN_ADMINS = [config.GCP.cdnAdmins];
@@ -375,173 +394,107 @@ const createFolder = async (
   }
 };
 
-/**
- * Create postproduction subfolders (Raw Footage, Edited Footage, Final Deliverables)
- * @param {string} parentPath - Parent folder path (without Website_Shoots_Flow/ prefix)
- * @param {ObjectId} parentFolderId - Parent folder's MongoDB _id
- * @param {Array} cpIds - Array of CP IDs
- * @param {string} orderId - Order ID
- * @param {string} userId - User/Client ID
- */
-const createPostProductionSubfolders = async (parentPath, parentFolderId, cpIds, orderId, userId) => {
-  const postProductionSubfolders = ['Raw Footage', 'Edited Footage', 'Final Deliverables'];
+const normalizeCpIds = (cpIds) => cpIds ? cpIds.map((item) => {
+  if (typeof item === 'string') return item;
+  if (item && item.id) return item.id.toString();
+  return item?.toString();
+}).filter(Boolean) : [];
 
-  // Normalize cpIds to simple string array
-  const normalizedCpIds = cpIds ? cpIds.map((item) => {
-    if (typeof item === 'string') return item;
-    if (item && item.id) return item.id.toString();
-    return item?.toString();
-  }).filter(Boolean) : [];
+const ensurePostProductionFolder = async ({
+  parentPath,
+  parentFolderId,
+  folderName,
+  folderType,
+  cpIds,
+  orderId,
+  userId
+}) => {
+  const normalizedCpIds = normalizeCpIds(cpIds);
+  const folderPath = `${parentPath.replace(/\/$/, '')}/${folderName}/`;
+  const gcsFolderPath = `Website_Shoots_Flow/${folderPath}`;
 
-  for (const subfolderName of postProductionSubfolders) {
-    const subfolderPath = `${parentPath.replace(/\/$/, '')}/${subfolderName}/`;
-    const gcsFolderPath = `Website_Shoots_Flow/${subfolderPath}`;
+  const gcsFolder = bucket.file(gcsFolderPath);
+  const [exists] = await gcsFolder.exists();
 
-    try {
-      // Create folder in GCS
-      const newFolder = bucket.file(gcsFolderPath);
-      const [exists] = await newFolder.exists();
-
-      if (!exists) {
-        const options = {
-          metadata: {
-            metadata: {
-              createdBy: JSON.stringify(normalizedCpIds),
-              orderId: JSON.stringify(orderId),
-              folderType: 'postproduction_subfolder', // Special type for postproduction subfolders
-              subfolderName: subfolderName
-            },
-          },
-        };
-        await newFolder.save("", options);
-        console.log(`✅ Created GCS Post-Production subfolder: ${gcsFolderPath}`);
-      }
-
-      // Check if subfolder already exists in database
-      let existingSubfolder = await FileMeta.findOne({ path: subfolderPath });
-
-      if (!existingSubfolder) {
-        // Determine specific folder type for permissions
-        let specificFolderType = 'postproduction_raw_footage';
-        if (subfolderName === 'Edited Footage') {
-          specificFolderType = 'postproduction_edited_footage';
-        } else if (subfolderName === 'Final Deliverables') {
-          specificFolderType = 'postproduction_final_deliverables';
-        }
-
-        // Create subfolder record in database
-        await FileMeta.create({
-          path: subfolderPath,
-          name: subfolderName,
-          userId: userId || null,
-          isFolder: true,
-          contentType: "folder",
-          size: 0,
-          isPublic: false,
-          fullPath: gcsFolderPath,
-          folderType: specificFolderType,
-          parentFolderId: parentFolderId,
-          metadata: {
-            orderId: orderId?.toString() || null,
-            cpIds: normalizedCpIds,
-            originalFolderType: 'postproduction', // Keep track of the parent type
-            subfolderName: subfolderName
-          }
-        });
-        console.log(`✅ Created database record for Post-Production subfolder: ${subfolderName}`);
-      } else {
-        console.log(`📁 Post-Production subfolder already exists in database: ${subfolderName}`);
-      }
-    } catch (error) {
-      console.error(`❌ Error creating Post-Production subfolder ${subfolderName}:`, error);
-      throw error;
-    }
+  if (!exists) {
+    await gcsFolder.save("", {
+      metadata: {
+        metadata: {
+          createdBy: JSON.stringify(normalizedCpIds),
+          orderId: JSON.stringify(orderId),
+          folderType: 'postproduction_subfolder',
+          subfolderName: folderName
+        },
+      },
+    });
+    console.log(`✅ Created GCS Post-Production subfolder: ${gcsFolderPath}`);
   }
+
+  let folderDoc = await FileMeta.findOne({ path: folderPath, isFolder: true });
+
+  if (!folderDoc) {
+    folderDoc = await FileMeta.create({
+      path: folderPath,
+      name: folderName,
+      userId: userId || null,
+      isFolder: true,
+      contentType: "folder",
+      size: 0,
+      isPublic: false,
+      fullPath: gcsFolderPath,
+      folderType,
+      parentFolderId,
+      metadata: {
+        orderId: orderId?.toString() || null,
+        cpIds: normalizedCpIds,
+        originalFolderType: 'postproduction',
+        subfolderName: folderName
+      }
+    });
+    console.log(`✅ Created database record for Post-Production subfolder: ${folderName}`);
+  } else {
+    console.log(`📁 Post-Production subfolder already exists in database: ${folderName}`);
+  }
+
+  return folderDoc;
 };
 
 /**
- * Create postproduction workflow subfolders only (Raw Footage, Edited Footage, Final Deliverables)
- * @param {string} parentPath - Parent folder path (without Website_Shoots_Flow/ prefix)
- * @param {ObjectId} parentFolderId - Parent folder's MongoDB _id
- * @param {Array} cpIds - Array of CP IDs
- * @param {string} orderId - Order ID
- * @param {string} userId - User/Client ID
+ * Create postproduction workflow folders:
+ * Raw Footage, Edits (Selected for Edits, Revisions), Final Deliverables.
  */
 const createPostProductionSubfoldersOnly = async (parentPath, parentFolderId, cpIds, orderId, userId) => {
-  const postProductionSubfolders = ['Raw Footage', 'Edited Footage', 'Final Deliverables'];
-
-  // Normalize cpIds to simple string array
-  const normalizedCpIds = cpIds ? cpIds.map((item) => {
-    if (typeof item === 'string') return item;
-    if (item && item.id) return item.id.toString();
-    return item?.toString();
-  }).filter(Boolean) : [];
-
-  for (const subfolderName of postProductionSubfolders) {
-    const subfolderPath = `${parentPath.replace(/\/$/, '')}/${subfolderName}/`;
-    const gcsFolderPath = `Website_Shoots_Flow/${subfolderPath}`;
-
+  for (const folderConfig of POST_PRODUCTION_SUBFOLDERS) {
     try {
-      // Create folder in GCS
-      const newFolder = bucket.file(gcsFolderPath);
-      const [exists] = await newFolder.exists();
+      const folderDoc = await ensurePostProductionFolder({
+        parentPath,
+        parentFolderId,
+        folderName: folderConfig.name,
+        folderType: folderConfig.folderType,
+        cpIds,
+        orderId,
+        userId
+      });
 
-      if (!exists) {
-        const options = {
-          metadata: {
-            metadata: {
-              createdBy: JSON.stringify(normalizedCpIds),
-              orderId: JSON.stringify(orderId),
-              folderType: 'postproduction_subfolder', // Special type for postproduction subfolders
-              subfolderName: subfolderName
-            },
-          },
-        };
-        await newFolder.save("", options);
-        console.log(`✅ Created GCS Post-Production subfolder: ${gcsFolderPath}`);
-      }
-
-      // Check if subfolder already exists in database
-      let existingSubfolder = await FileMeta.findOne({ path: subfolderPath });
-
-      if (!existingSubfolder) {
-        // Determine specific folder type for permissions
-        let specificFolderType = 'postproduction_raw_footage';
-        if (subfolderName === 'Edited Footage') {
-          specificFolderType = 'postproduction_edited_footage';
-        } else if (subfolderName === 'Final Deliverables') {
-          specificFolderType = 'postproduction_final_deliverables';
-        }
-
-        // Create subfolder record in database
-        await FileMeta.create({
-          path: subfolderPath,
-          name: subfolderName,
-          userId: userId || null,
-          isFolder: true,
-          contentType: "folder",
-          size: 0,
-          isPublic: false,
-          fullPath: gcsFolderPath,
-          folderType: specificFolderType,
-          parentFolderId: parentFolderId,
-          metadata: {
-            orderId: orderId?.toString() || null,
-            cpIds: normalizedCpIds,
-            originalFolderType: 'postproduction', // Keep track of the parent type
-            subfolderName: subfolderName
-          }
+      for (const childName of folderConfig.children) {
+        await ensurePostProductionFolder({
+          parentPath: folderDoc.path,
+          parentFolderId: folderDoc._id,
+          folderName: childName,
+          folderType: folderConfig.folderType,
+          cpIds,
+          orderId,
+          userId
         });
-        console.log(`✅ Created database record for Post-Production subfolder: ${subfolderName}`);
-      } else {
-        console.log(`📁 Post-Production subfolder already exists in database: ${subfolderName}`);
       }
     } catch (error) {
-      console.error(`❌ Error creating Post-Production subfolder ${subfolderName}:`, error);
+      console.error(`❌ Error creating Post-Production subfolder ${folderConfig.name}:`, error);
       throw error;
     }
   }
 };
+
+const createPostProductionSubfolders = createPostProductionSubfoldersOnly;
 
 /**
  * Create production workflow subfolders (Pre-Production, Post-Production with subfolders)
@@ -1370,6 +1323,40 @@ const deleteFile = async (filepath) => {
     return { deleted: true, deletedCount: deleteResult.deletedCount };
   } catch (error) {
     console.error('❌ Error in deleteFile:', error);
+    throw error;
+  }
+};
+
+const copyFile = async (sourcePath, destinationPath) => {
+  try {
+    checkGcpEnabled();
+
+    const cleanSourcePath = String(sourcePath || "").replace(/^\/+/, "");
+    const cleanDestinationPath = String(destinationPath || "").replace(/^\/+/, "");
+
+    if (!cleanSourcePath || !cleanDestinationPath) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "sourcePath and destinationPath are required");
+    }
+
+    const sourceFile = bucket.file(cleanSourcePath);
+    const [exists] = await sourceFile.exists();
+    if (!exists) {
+      throw new ApiError(httpStatus.NOT_FOUND, "Source file not found");
+    }
+
+    const destinationFile = bucket.file(cleanDestinationPath);
+    const [copiedFile] = await sourceFile.copy(destinationFile);
+    const [metadata] = await copiedFile.getMetadata();
+
+    return {
+      sourcePath: cleanSourcePath,
+      destinationPath: cleanDestinationPath,
+      size: Number(metadata?.size || 0),
+      contentType: metadata?.contentType || "application/octet-stream",
+      generation: metadata?.generation || null,
+    };
+  } catch (error) {
+    logger.error(`Error copying GCP file: ${error.message}`);
     throw error;
   }
 };
@@ -2636,7 +2623,18 @@ const checkUploadPermission = async (folderPath, role) => {
       detectedFolderType = 'postproduction';
     } else if (pathLower.includes('/raw footage/') || pathLower.endsWith('/raw footage')) {
       detectedFolderType = 'postproduction_raw_footage';
-    } else if (pathLower.includes('/edited footage/') || pathLower.endsWith('/edited footage')) {
+    } else if (
+      EDIT_FOLDER_NAMES.some((name) => {
+        const folderName = name.toLowerCase();
+        const compactName = folderName.replace(/\s+/g, '');
+        return (
+          pathLower.includes(`/${folderName}/`) ||
+          pathLower.endsWith(`/${folderName}`) ||
+          pathLower.includes(`/${compactName}/`) ||
+          pathLower.endsWith(`/${compactName}`)
+        );
+      })
+    ) {
       detectedFolderType = 'postproduction_edited_footage';
     } else if (pathLower.includes('/final deliverables/') || pathLower.endsWith('/final deliverables')) {
       detectedFolderType = 'postproduction_final_deliverables';
@@ -3057,7 +3055,7 @@ const getFolderCounts = async (baseFolderPath, userId, role) => {
       'work-in-progress': {
         count: 0,
         size: 0,
-        description: isUser ? 'Edited Footage (work in progress)' : 'Raw Footage + Edited Footage (not yet final)'
+        description: isUser ? 'Edits (work in progress)' : 'Raw Footage + Edits (not yet final)'
       },
       'final-delivery': {
         count: 0,
@@ -3115,9 +3113,15 @@ const getFolderCounts = async (baseFolderPath, userId, role) => {
         }
         // For user role: Raw footage is HIDDEN - don't add to any visible counts
       }
-      // Post-production - Edited Footage (supports both postproduction and post-production folder names)
-      else if (filePath.includes('/postproduction/edited footage/') || filePath.includes('/postproduction/editedfootage/') ||
-               filePath.includes('/post-production/edited footage/') || filePath.includes('/post-production/editedfootage/')) {
+      // Post-production - Edits (also supports legacy Edited Footage folders)
+      else if (
+        filePath.includes('/postproduction/edits/') ||
+        filePath.includes('/post-production/edits/') ||
+        filePath.includes('/postproduction/edited footage/') ||
+        filePath.includes('/postproduction/editedfootage/') ||
+        filePath.includes('/post-production/edited footage/') ||
+        filePath.includes('/post-production/editedfootage/')
+      ) {
         counts['post-production'].count++;
         counts['post-production'].size += fileSize;
         counts['post-production'].subfolders['edited-footage'].count++;
@@ -3168,7 +3172,7 @@ const getFolderCounts = async (baseFolderPath, userId, role) => {
     console.log(`   Pre-production: ${counts['pre-production'].count}`);
     console.log(`   Post-production (total): ${counts['post-production'].count}`);
     console.log(`   - Raw footage: ${counts['post-production'].subfolders['raw-footage'].count}${isUser ? ' (HIDDEN from user)' : ''}`);
-    console.log(`   - Edited footage: ${counts['post-production'].subfolders['edited-footage'].count}`);
+    console.log(`   - Edits: ${counts['post-production'].subfolders['edited-footage'].count}`);
     console.log(`   - Final deliverables: ${counts['post-production'].subfolders['final-deliverables'].count}`);
     console.log(`   Work in progress: ${counts['work-in-progress'].count}`);
     console.log(`   Final delivery: ${counts['final-delivery'].count}`);
@@ -3221,7 +3225,7 @@ const getFolderCounts = async (baseFolderPath, userId, role) => {
         count: 0,
         size: 0,
         sizeFormatted: '0 B',
-        description: 'Raw Footage + Edited Footage (not yet final)'
+        description: 'Raw Footage + Edits (not yet final)'
       },
       'final-delivery': {
         count: 0,
@@ -3669,9 +3673,11 @@ module.exports = {
   createChatFolder,
   createProductionSubfolders,
   createPostProductionSubfoldersOnly,
+  ensurePostProductionFolder,
   downloadFiles,
   uploadFile,
   deleteFile,
+  copyFile,
   getFiles,
   getChatFiles,
   bucket,

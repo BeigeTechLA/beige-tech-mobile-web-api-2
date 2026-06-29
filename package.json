@@ -7,7 +7,9 @@
   "license": "ISC",
   "scripts": {
     "start": "NODE_ENV=production node src/index.js",
+    "start:face-scan-worker": "NODE_ENV=production node src/workers/faceScan.worker.js",
     "dev": "cross-env NODE_ENV=development nodemon src/index.js",
+    "dev:face-scan-worker": "cross-env NODE_ENV=development node src/workers/faceScan.worker.js",
     "test": "jest -i --colors --verbose --detectOpenHandles",
     "test:unit": "jest tests/unit -i --colors --verbose",
     "test:integration": "jest tests/integration -i --colors --verbose",
@@ -32,7 +34,7 @@
     "health:check": "node scripts/health-check.js",
     "seed:test-data": "node scripts/seed-test-data.js",
     "validate:production": "node scripts/validate-production-readiness.js",
-    "prepare": "command -v husky >/dev/null 2>&1 && husky install || true"
+    "prepare": "node -e \"try { require('child_process').execSync('husky install', { stdio: 'inherit', shell: true }); } catch (error) {}\""
   },
   "keywords": [
     "node",
