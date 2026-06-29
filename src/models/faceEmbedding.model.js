@@ -63,6 +63,7 @@ const faceEmbeddingSchema = new mongoose.Schema(
 );
 
 faceEmbeddingSchema.index({ externalId: 1, status: 1, updatedAt: -1 });
+faceEmbeddingSchema.index({ externalId: 1, status: 1, filepath: 1 });
 faceEmbeddingSchema.plugin(toJSON);
 
 const FaceEmbedding = mongoose.model("FaceEmbedding", faceEmbeddingSchema);

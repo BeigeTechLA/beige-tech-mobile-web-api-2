@@ -1,17 +1,65 @@
 const httpStatus = require("http-status");
+const mongoose = require("mongoose");
 const pick = require("../utils/pick");
 const catchAsync = require("../utils/catchAsync");
 const ApiError = require("../utils/ApiError");
 const { chatService } = require("../services");
 
+const normalizeQueryList = (value) => {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => normalizeQueryList(item));
+  }
+
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
 const getChatRooms = catchAsync(async (req, res) => {
   const requestQuery = req.query;
-  const filter = pick(requestQuery, ["client_id", "order_id"]);
+  const filter = pick(requestQuery, ["order_id"]);
+  const cpIds = [
+    ...new Set([
+      ...normalizeQueryList(requestQuery.cp_id),
+      ...normalizeQueryList(requestQuery.cp_ids),
+    ]),
+  ];
+  const clientIds = [
+    ...new Set([
+      ...normalizeQueryList(requestQuery.client_id),
+      ...normalizeQueryList(requestQuery.client_ids),
+    ]),
+  ];
 
-  if (requestQuery.cp_id) {
+  if (cpIds.length) {
     filter.cp_ids = {
-      $elemMatch: { id: requestQuery.cp_id, decision: { $ne: "cancelled" } },
+      $elemMatch: {
+        id: cpIds.length === 1 ? cpIds[0] : { $in: cpIds },
+        decision: { $ne: "cancelled" },
+      },
     };
+  }
+  if (clientIds.length) {
+    const objectIds = clientIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const emails = clientIds.map((id) => id.toLowerCase()).filter((id) => id.includes("@"));
+    const clientFilters = [
+      { "client_snapshot.id": clientIds.length === 1 ? clientIds[0] : { $in: clientIds } },
+    ];
+
+    if (objectIds.length) {
+      clientFilters.push({
+        client_id: objectIds.length === 1 ? objectIds[0] : { $in: objectIds },
+      });
+    }
+
+    if (emails.length) {
+      clientFilters.push({
+        "client_snapshot.email": emails.length === 1 ? emails[0] : { $in: emails },
+      });
+    }
+
+    filter.$or = clientFilters;
   }
   if (requestQuery.manager_id) {
     filter.manager_ids = { $elemMatch: { id: requestQuery.manager_id } };
