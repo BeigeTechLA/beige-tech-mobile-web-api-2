@@ -8,6 +8,8 @@ const TokenSchema = new mongoose.Schema({
   token_type: String,
   expiry_date: Number,
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  appUserEmail: { type: String, trim: true, lowercase: true },
+  googleEmail: { type: String, trim: true, lowercase: true },
 });
 
 // add plugin that converts mongoose to json

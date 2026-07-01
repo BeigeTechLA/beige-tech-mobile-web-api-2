@@ -234,6 +234,12 @@ exports.createMeetEvent = async (req, res, next) => {
       endDateTime: req.body.endDateTime,
       orderId: req.body.orderId,
       userId: req.body.userId || req.query.userId || getUserIdFromRequest(req),
+      appUserEmail: req.body.appUserEmail || req.query.appUserEmail || req.user?.email,
+      selectedGoogleEmail:
+        req.body.selectedGoogleEmail ||
+        req.body.googleEmail ||
+        req.query.selectedGoogleEmail ||
+        req.query.googleEmail,
     };
 
     let response = null;

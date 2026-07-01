@@ -1,4 +1,7 @@
-const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
+const SCOPES = [
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/userinfo.email",
+];
 
 const trimTrailingSlash = (value = "") => value.replace(/\/+$/, "");
 

@@ -7,6 +7,69 @@ const readline = require("readline");
 const emailService = require("./email.service");
 const orderService = require("./order.service");
 const { format, parseISO } = require("date-fns");
+
+const CALENDAR_ID = "primary";
+
+const normalizeEmail = (email) => (email ? String(email).trim().toLowerCase() : null);
+
+const encodeOAuthState = (state) =>
+  Buffer.from(JSON.stringify(state)).toString("base64url");
+
+const decodeOAuthState = (state) => {
+  if (!state) return {};
+
+  try {
+    return JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
+  } catch (err) {
+    console.error("Invalid Google OAuth state:", err.message);
+    return {};
+  }
+};
+
+const buildTokenQuery = ({ userId, selectedGoogleEmail }) => {
+  const query = {};
+
+  if (userId) {
+    query.userId = userId;
+  }
+
+  if (selectedGoogleEmail) {
+    query.googleEmail = normalizeEmail(selectedGoogleEmail);
+  }
+
+  return query;
+};
+
+const buildAuthUrl = (oAuth2Client, context = {}) =>
+  oAuth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: SCOPES,
+    state: encodeOAuthState({
+      userId: context.userId || null,
+      appUserEmail: normalizeEmail(context.appUserEmail),
+      selectedGoogleEmail: normalizeEmail(context.selectedGoogleEmail),
+    }),
+  });
+
+const getGoogleAccountEmail = async (auth) => {
+  try {
+    const oauth2 = google.oauth2({ version: "v2", auth });
+    const { data } = await oauth2.userinfo.get();
+    return normalizeEmail(data?.email);
+  } catch (err) {
+    console.error("Could not read Google account email:", err.message);
+    return null;
+  }
+};
+
+const toGoogleCredentials = (tokenDoc) => ({
+  access_token: tokenDoc.access_token,
+  refresh_token: tokenDoc.refresh_token,
+  scope: tokenDoc.scope,
+  token_type: tokenDoc.token_type,
+  expiry_date: tokenDoc.expiry_date,
+});
 /**
  * Create meet token or handle OAuth2 callback
  * @param {Object} data Data needed for creating a meet token
@@ -21,7 +84,7 @@ const { format, parseISO } = require("date-fns");
 const createMeetToken = async (data) => {
   if (data.code) {
     // Handle OAuth2 callback
-    return await oauth2callback(data.code);
+    return await oauth2callback(data.code, data.state);
   } else {
     // Create meet token
     return await generateMeetLink(data);
@@ -40,7 +103,16 @@ const createMeetToken = async (data) => {
  */
 const generateMeetLink = async (data) => {
   return new Promise(async (resolve, reject) => {
-    const { summary, location, description, startDateTime, endDateTime, userId } = data;
+    const {
+      summary,
+      location,
+      description,
+      startDateTime,
+      endDateTime,
+      userId,
+      appUserEmail,
+      selectedGoogleEmail,
+    } = data;
 
     // Build attendees list - add the meeting creator if userId is provided
     const attendees = [];
@@ -81,17 +153,26 @@ const generateMeetLink = async (data) => {
       guestsCanSeeOtherGuests: true,
     };
 
-    authorize(async (auth, authUrl) => {
+    authorize({ userId, appUserEmail, selectedGoogleEmail }, async (auth, authUrl, tokenDoc) => {
       if (authUrl) {
         resolve({
           authUrl,
         });
       } else {
+        console.log("[Google Calendar] Creating event", {
+          appUserId: userId || null,
+          appUserEmail: normalizeEmail(appUserEmail),
+          selectedGoogleEmail: normalizeEmail(selectedGoogleEmail),
+          tokenId: tokenDoc?._id?.toString(),
+          tokenGoogleEmail: tokenDoc?.googleEmail || null,
+          calendarId: CALENDAR_ID,
+        });
+
         const calendar = google.calendar({ version: "v3", auth });
         calendar.events.insert(
           {
             auth,
-            calendarId: "primary",
+            calendarId: CALENDAR_ID,
             resource: event,
             conferenceDataVersion: 1,
             sendUpdates: "all", // Send email invitations to attendees
@@ -150,7 +231,7 @@ ${meetLink}`;
  * Authorize and get OAuth2 client
  * @param {function} callback Callback function with authorized OAuth2 client
  */
-async function authorize(callback) {
+async function authorize(context, callback) {
   const { client_secret, client_id } = credentials.installed;
   
   // Use the environment variable here instead of redirect_uris[0]
@@ -163,17 +244,24 @@ async function authorize(callback) {
   );
 
   try {
-    const tokenDoc = await MeetToken.findOne({});
+    const query = buildTokenQuery(context);
+    const hasSpecificLookup = Object.keys(query).length > 0;
+    const tokenDoc = hasSpecificLookup ? await MeetToken.findOne(query) : null;
+
+    console.log("[Google Calendar] Token lookup", {
+      appUserId: context.userId || null,
+      appUserEmail: normalizeEmail(context.appUserEmail),
+      selectedGoogleEmail: normalizeEmail(context.selectedGoogleEmail),
+      query,
+      matchedTokenId: tokenDoc?._id?.toString() || null,
+      matchedGoogleEmail: tokenDoc?.googleEmail || null,
+    });
 
     if (!tokenDoc) {
-      const authUrl = oAuth2Client.generateAuthUrl({
-        access_type: "offline",
-        prompt: "consent", // force consent screen to get a new refresh token
-        scope: SCOPES,
-      });
+      const authUrl = buildAuthUrl(oAuth2Client, context);
       callback(null, authUrl);
     } else {
-      oAuth2Client.setCredentials(tokenDoc.toObject());
+      oAuth2Client.setCredentials(toGoogleCredentials(tokenDoc));
 
       // Check if access token is expired
       if (tokenDoc.expiry_date <= Date.now()) {
@@ -189,21 +277,17 @@ async function authorize(callback) {
             expiry_date: newToken.credentials.expiry_date,
           };
 
-          await MeetToken.updateOne({}, newCredentials);
+          await MeetToken.updateOne({ _id: tokenDoc._id }, newCredentials);
 
           oAuth2Client.setCredentials(newCredentials);
-          callback(oAuth2Client);
+          callback(oAuth2Client, null, tokenDoc);
         } catch (err) {
           console.error("Error refreshing access token:", err);
-          const authUrl = oAuth2Client.generateAuthUrl({
-            access_type: "offline",
-            prompt: "consent", // force consent screen to get a new refresh token
-            scope: SCOPES,
-          });
+          const authUrl = buildAuthUrl(oAuth2Client, context);
           callback(null, authUrl);
         }
       } else {
-        callback(oAuth2Client);
+        callback(oAuth2Client, null, tokenDoc);
       }
     }
   } catch (err) {
@@ -216,8 +300,9 @@ async function authorize(callback) {
  * @param {string} code Authorization code from OAuth2 callback
  * @returns {Promise<{ message: string }>}
  */
-const oauth2callback = async (code) => {
+const oauth2callback = async (code, state) => {
   if (code) {
+    const context = decodeOAuthState(state);
     const { client_secret, client_id } = credentials.installed;
     
     // Use the same environment variable here
@@ -240,8 +325,39 @@ const oauth2callback = async (code) => {
         };
       }
 
-      const tokenDoc = new MeetToken(tokens);
-      await tokenDoc.save();
+      const googleEmail =
+        (await getGoogleAccountEmail(oAuth2Client)) ||
+        normalizeEmail(context.selectedGoogleEmail);
+
+      const tokenPayload = {
+        ...tokens,
+        userId: context.userId || undefined,
+        appUserEmail: normalizeEmail(context.appUserEmail) || undefined,
+        googleEmail: googleEmail || undefined,
+      };
+
+      const tokenQuery = buildTokenQuery({
+        userId: context.userId,
+        selectedGoogleEmail: googleEmail,
+      });
+
+      const tokenDoc =
+        Object.keys(tokenQuery).length > 0
+          ? await MeetToken.findOneAndUpdate(tokenQuery, tokenPayload, {
+              new: true,
+              upsert: true,
+              setDefaultsOnInsert: true,
+            })
+          : await MeetToken.create(tokenPayload);
+
+      console.log("[Google Calendar] Saved OAuth token", {
+        appUserId: context.userId || null,
+        appUserEmail: normalizeEmail(context.appUserEmail),
+        selectedGoogleEmail: normalizeEmail(context.selectedGoogleEmail),
+        tokenId: tokenDoc?._id?.toString(),
+        tokenGoogleEmail: tokenDoc?.googleEmail || null,
+      });
+
       return { message: "Authorization successful! You can close this tab." };
     } catch (err) {
       console.error("Error retrieving access token", err);

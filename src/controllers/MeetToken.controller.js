@@ -13,7 +13,14 @@ const createMeetToken = catchAsync(async (req, res) => {
       endDateTime,
       orderId,
     } = req.body;
-    const { userId } = req.query;
+    const userId = req.body.userId || req.query.userId || req.user?.id || req.user?._id;
+    const appUserEmail = req.body.appUserEmail || req.query.appUserEmail || req.user?.email;
+    const selectedGoogleEmail =
+      req.body.selectedGoogleEmail ||
+      req.body.googleEmail ||
+      req.query.selectedGoogleEmail ||
+      req.query.googleEmail;
+
     // Assuming meetTokenService.createMeetToken returns the meetLink or message
     const response = await meetTokenService.createMeetToken({
       summary,
@@ -23,6 +30,8 @@ const createMeetToken = catchAsync(async (req, res) => {
       endDateTime,
       orderId,
       userId,
+      appUserEmail,
+      selectedGoogleEmail,
     });
 
     if (response.meetLink) {
@@ -39,7 +48,7 @@ const createMeetToken = catchAsync(async (req, res) => {
 });
 
 const oauth2callback = catchAsync(async (req, res) => {
-  const url = await meetTokenService.oauth2callback(req.query.code);
+  const url = await meetTokenService.oauth2callback(req.query.code, req.query.state);
   res.status(httpStatus.CREATED).send(url);
 });
 
