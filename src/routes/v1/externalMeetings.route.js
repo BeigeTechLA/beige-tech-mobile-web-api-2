@@ -1,5 +1,6 @@
 const express = require("express");
 const auth = require("../../middlewares/auth");
+const { internalBridgeOrJwtAuth } = require("../../middlewares/internalBridgeAuth");
 const externalMeetingsController = require("../../controllers/externalMeetings.controller");
 
 const router = express.Router();
@@ -15,7 +16,7 @@ router.get("/:meetingId", auth(), externalMeetingsController.getMeetingById);
 router.patch("/:meetingId", auth(), externalMeetingsController.updateMeeting);
 router.delete("/:meetingId", auth(), externalMeetingsController.deleteMeeting);
 
-router.post("/create-event", auth(), externalMeetingsController.createMeetEvent);
+router.post("/create-event", internalBridgeOrJwtAuth(), externalMeetingsController.createMeetEvent);
 router.post("/schedule/:meetingId", auth(), externalMeetingsController.placeChangeRequest);
 router.patch(
   "/schedule/:meetingId/:status",

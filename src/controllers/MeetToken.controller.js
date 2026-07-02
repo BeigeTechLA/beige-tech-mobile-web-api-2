@@ -3,6 +3,30 @@ const ApiError = require("../utils/ApiError");
 const catchAsync = require("../utils/catchAsync");
 const { meetTokenService } = require("../services");
 
+const getCreateEventIdentity = (req) => {
+  if (req.authMode === "internal-bridge") {
+    return {
+      userId:
+        req.body.userId ||
+        req.body.appUserId ||
+        req.headers["x-app-user-id"] ||
+        req.headers["x-user-id"] ||
+        null,
+      appUserEmail:
+        req.body.appUserEmail ||
+        req.body.userEmail ||
+        req.headers["x-app-user-email"] ||
+        req.headers["x-user-email"] ||
+        null,
+    };
+  }
+
+  return {
+    userId: req.user?.id || req.user?._id,
+    appUserEmail: req.user?.email,
+  };
+};
+
 const createMeetToken = catchAsync(async (req, res) => {
   try {
     const {
@@ -13,15 +37,24 @@ const createMeetToken = catchAsync(async (req, res) => {
       endDateTime,
       orderId,
     } = req.body;
-    const userId = req.body.userId || req.query.userId || req.user?.id || req.user?._id;
-    const appUserEmail = req.body.appUserEmail || req.query.appUserEmail || req.user?.email;
+    const { userId, appUserEmail } = getCreateEventIdentity(req);
     const selectedGoogleEmail =
       req.body.selectedGoogleEmail ||
       req.body.googleEmail ||
       req.query.selectedGoogleEmail ||
       req.query.googleEmail;
 
-    // Assuming meetTokenService.createMeetToken returns the meetLink or message
+    if (!userId || !appUserEmail) {
+      throw new ApiError(httpStatus.UNAUTHORIZED, "Authenticated user id and email are required");
+    }
+
+    console.log("[Google Calendar] Create-event request user", {
+      authMode: req.authMode || "jwt",
+      appUserId: userId?.toString(),
+      appUserEmail,
+      selectedGoogleEmail,
+    });
+
     const response = await meetTokenService.createMeetToken({
       summary,
       location,

@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 const { SCOPES } = require("../utils/meetToken.utils");
 const { credentials } = require("../utils/meetToken.utils");
 const { MeetToken, Order, User } = require("../models");
@@ -11,6 +12,22 @@ const { format, parseISO } = require("date-fns");
 const CALENDAR_ID = "primary";
 
 const normalizeEmail = (email) => (email ? String(email).trim().toLowerCase() : null);
+
+const normalizeAppUserId = (userId) => (userId ? String(userId).trim() : null);
+
+const toTokenUserId = (userId) => {
+  const normalizedUserId = normalizeAppUserId(userId);
+
+  if (!normalizedUserId) {
+    return null;
+  }
+
+  if (mongoose.Types.ObjectId.isValid(normalizedUserId)) {
+    return new mongoose.Types.ObjectId(normalizedUserId);
+  }
+
+  return normalizedUserId;
+};
 
 const encodeOAuthState = (state) =>
   Buffer.from(JSON.stringify(state)).toString("base64url");
@@ -27,11 +44,13 @@ const decodeOAuthState = (state) => {
 };
 
 const buildTokenQuery = ({ userId, selectedGoogleEmail }) => {
-  const query = {};
+  const tokenUserId = toTokenUserId(userId);
 
-  if (userId) {
-    query.userId = userId;
+  if (!tokenUserId) {
+    throw new Error("Authenticated user id is required for Google Calendar token lookup");
   }
+
+  const query = { userId: tokenUserId };
 
   if (selectedGoogleEmail) {
     query.googleEmail = normalizeEmail(selectedGoogleEmail);
@@ -114,9 +133,14 @@ const generateMeetLink = async (data) => {
       selectedGoogleEmail,
     } = data;
 
+    if (!userId || !appUserEmail) {
+      reject(new Error("Authenticated user id and email are required to create a Google Calendar event"));
+      return;
+    }
+
     // Build attendees list - add the meeting creator if userId is provided
     const attendees = [];
-    if (userId) {
+    if (mongoose.Types.ObjectId.isValid(normalizeAppUserId(userId))) {
       try {
         const creator = await User.findById(userId);
         if (creator && creator.email) {
@@ -153,14 +177,19 @@ const generateMeetLink = async (data) => {
       guestsCanSeeOtherGuests: true,
     };
 
-    authorize({ userId, appUserEmail, selectedGoogleEmail }, async (auth, authUrl, tokenDoc) => {
+    authorize({ userId, appUserEmail, selectedGoogleEmail }, async (auth, authUrl, tokenDoc, authError) => {
+      if (authError) {
+        reject(authError);
+        return;
+      }
+
       if (authUrl) {
         resolve({
           authUrl,
         });
       } else {
         console.log("[Google Calendar] Creating event", {
-          appUserId: userId || null,
+          appUserId: normalizeAppUserId(userId),
           appUserEmail: normalizeEmail(appUserEmail),
           selectedGoogleEmail: normalizeEmail(selectedGoogleEmail),
           tokenId: tokenDoc?._id?.toString(),
@@ -232,6 +261,16 @@ ${meetLink}`;
  * @param {function} callback Callback function with authorized OAuth2 client
  */
 async function authorize(context, callback) {
+  if (!context.userId || !context.appUserEmail) {
+    callback(
+      null,
+      null,
+      null,
+      new Error("Authenticated user id and email are required for Google Calendar authorization")
+    );
+    return;
+  }
+
   const { client_secret, client_id } = credentials.installed;
   
   // Use the environment variable here instead of redirect_uris[0]
@@ -245,16 +284,16 @@ async function authorize(context, callback) {
 
   try {
     const query = buildTokenQuery(context);
-    const hasSpecificLookup = Object.keys(query).length > 0;
-    const tokenDoc = hasSpecificLookup ? await MeetToken.findOne(query) : null;
+    const tokenDoc = await MeetToken.findOne(query);
 
     console.log("[Google Calendar] Token lookup", {
-      appUserId: context.userId || null,
+      appUserId: normalizeAppUserId(context.userId),
       appUserEmail: normalizeEmail(context.appUserEmail),
       selectedGoogleEmail: normalizeEmail(context.selectedGoogleEmail),
       query,
       matchedTokenId: tokenDoc?._id?.toString() || null,
       matchedGoogleEmail: tokenDoc?.googleEmail || null,
+      calendarId: CALENDAR_ID,
     });
 
     if (!tokenDoc) {
@@ -292,6 +331,7 @@ async function authorize(context, callback) {
     }
   } catch (err) {
     console.error("Error retrieving token from DB:", err);
+    callback(null, null, null, err);
   }
 }
 
@@ -303,6 +343,17 @@ async function authorize(context, callback) {
 const oauth2callback = async (code, state) => {
   if (code) {
     const context = decodeOAuthState(state);
+
+    if (!context.userId || !context.appUserEmail) {
+      console.error("[Google Calendar] OAuth callback missing app user context", {
+        appUserId: normalizeAppUserId(context.userId),
+        appUserEmail: normalizeEmail(context.appUserEmail),
+      });
+      return {
+        message: "Authorization failed. Missing logged-in user context.",
+      };
+    }
+
     const { client_secret, client_id } = credentials.installed;
     
     // Use the same environment variable here
@@ -331,7 +382,7 @@ const oauth2callback = async (code, state) => {
 
       const tokenPayload = {
         ...tokens,
-        userId: context.userId || undefined,
+        userId: toTokenUserId(context.userId) || undefined,
         appUserEmail: normalizeEmail(context.appUserEmail) || undefined,
         googleEmail: googleEmail || undefined,
       };
@@ -341,21 +392,19 @@ const oauth2callback = async (code, state) => {
         selectedGoogleEmail: googleEmail,
       });
 
-      const tokenDoc =
-        Object.keys(tokenQuery).length > 0
-          ? await MeetToken.findOneAndUpdate(tokenQuery, tokenPayload, {
-              new: true,
-              upsert: true,
-              setDefaultsOnInsert: true,
-            })
-          : await MeetToken.create(tokenPayload);
+      const tokenDoc = await MeetToken.findOneAndUpdate(tokenQuery, tokenPayload, {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      });
 
       console.log("[Google Calendar] Saved OAuth token", {
-        appUserId: context.userId || null,
+        appUserId: normalizeAppUserId(context.userId),
         appUserEmail: normalizeEmail(context.appUserEmail),
         selectedGoogleEmail: normalizeEmail(context.selectedGoogleEmail),
         tokenId: tokenDoc?._id?.toString(),
         tokenGoogleEmail: tokenDoc?.googleEmail || null,
+        calendarId: CALENDAR_ID,
       });
 
       return { message: "Authorization successful! You can close this tab." };

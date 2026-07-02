@@ -9,6 +9,7 @@ const EXTERNAL_MEETINGS_BASE_URL =
   "";
 const EXTERNAL_MEETINGS_KEY =
   process.env.EXTERNAL_MEETINGS_KEY ||
+  process.env.INTERNAL_BRIDGE_KEY ||
   process.env.INTERNAL_FILE_MANAGER_KEY ||
   "beige-internal-dev-key";
 
@@ -37,6 +38,30 @@ const normalizeMeetingResult = (meeting, orderId) => {
 
 const getUserIdFromRequest = (req) =>
   req.user?.id || req.user?._id || req.user?.userId || null;
+
+const getCreateEventIdentity = (req) => {
+  if (req.authMode === "internal-bridge") {
+    return {
+      userId:
+        req.body.userId ||
+        req.body.appUserId ||
+        req.headers["x-app-user-id"] ||
+        req.headers["x-user-id"] ||
+        null,
+      appUserEmail:
+        req.body.appUserEmail ||
+        req.body.userEmail ||
+        req.headers["x-app-user-email"] ||
+        req.headers["x-user-email"] ||
+        null,
+    };
+  }
+
+  return {
+    userId: getUserIdFromRequest(req),
+    appUserEmail: req.user?.email,
+  };
+};
 
 const buildProxyHeaders = (req) => {
   const headers = {
@@ -226,6 +251,12 @@ exports.respondToMeetingInvitation = async (req, res, next) => {
 
 exports.createMeetEvent = async (req, res, next) => {
   try {
+    const { userId, appUserEmail } = getCreateEventIdentity(req);
+
+    if (!userId || !appUserEmail) {
+      throw new ApiError(httpStatus.UNAUTHORIZED, "Authenticated user id and email are required");
+    }
+
     const payload = {
       summary: req.body.summary,
       location: req.body.location,
@@ -233,14 +264,21 @@ exports.createMeetEvent = async (req, res, next) => {
       startDateTime: req.body.startDateTime,
       endDateTime: req.body.endDateTime,
       orderId: req.body.orderId,
-      userId: req.body.userId || req.query.userId || getUserIdFromRequest(req),
-      appUserEmail: req.body.appUserEmail || req.query.appUserEmail || req.user?.email,
+      userId,
+      appUserEmail,
       selectedGoogleEmail:
         req.body.selectedGoogleEmail ||
         req.body.googleEmail ||
         req.query.selectedGoogleEmail ||
         req.query.googleEmail,
     };
+
+    console.log("[Google Calendar] External create-event request user", {
+      authMode: req.authMode || "jwt",
+      appUserId: userId?.toString(),
+      appUserEmail,
+      selectedGoogleEmail: payload.selectedGoogleEmail,
+    });
 
     let response = null;
 
