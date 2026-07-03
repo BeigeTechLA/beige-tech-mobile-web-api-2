@@ -46,3 +46,4 @@ module.exports.emailEnhancedService = require("./email.enhanced.service");
 module.exports.globalFeeService = require("./globalFee.service");
 module.exports.portfolioService = require("./portfolio.service");
 module.exports.frameioService = require("./frameio.service");
+module.exports.productionFolderService = require("./productionFolder.service");

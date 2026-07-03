@@ -2,6 +2,7 @@ const httpStatus = require("http-status");
 const mongoose = require("mongoose");
 const { FileMeta, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
+const productionFolderService = require("../services/productionFolder.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
 const { ensurePostProductionFolder } = gcpFileService;
 const sendgridService = require("../services/sendgrid.service");
@@ -1211,6 +1212,41 @@ exports.getWorkspaceFiles = async (req, res, next) => {
         files: contents.files,
       },
     });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.getProductionFolderMatches = async (req, res, next) => {
+  try {
+    const productionFilter = String(req.query.production_filter || req.query.productionFilter || "").trim();
+    const isDebug =
+      String(req.query.debug || "").toLowerCase() === "true" &&
+      process.env.NODE_ENV !== "production";
+
+    if (!productionFilter) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "production_filter is required",
+      });
+    }
+
+    const result = await productionFolderService.getProductionFolderMatches(productionFilter);
+    const response = {
+      success: true,
+      matchedIds: result.matchedIds,
+    };
+
+    if (isDebug) {
+      response.debug = result.summary;
+      console.log("[production-folder-matches]", {
+        production_filter: productionFilter,
+        matchedCount: result.summary.matchedCount,
+        evaluatedCount: result.summary.evaluatedCount,
+      });
+    }
+
+    return res.status(httpStatus.OK).json(response);
   } catch (error) {
     return next(error);
   }
