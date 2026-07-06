@@ -7,6 +7,8 @@ const readline = require("readline");
 const emailService = require("./email.service");
 const orderService = require("./order.service");
 const { format, parseISO } = require("date-fns");
+
+const getStoredMeetToken = () => MeetToken.findOne({}).sort({ _id: -1 });
 /**
  * Create meet token or handle OAuth2 callback
  * @param {Object} data Data needed for creating a meet token
@@ -163,7 +165,7 @@ async function authorize(callback) {
   );
 
   try {
-    const tokenDoc = await MeetToken.findOne({});
+    const tokenDoc = await getStoredMeetToken();
 
     if (!tokenDoc) {
       const authUrl = oAuth2Client.generateAuthUrl({
@@ -189,7 +191,7 @@ async function authorize(callback) {
             expiry_date: newToken.credentials.expiry_date,
           };
 
-          await MeetToken.updateOne({}, newCredentials);
+          await MeetToken.updateOne({ _id: tokenDoc._id }, newCredentials);
 
           oAuth2Client.setCredentials(newCredentials);
           callback(oAuth2Client);
@@ -240,8 +242,12 @@ const oauth2callback = async (code) => {
         };
       }
 
-      const tokenDoc = new MeetToken(tokens);
-      await tokenDoc.save();
+      const tokenDoc = await MeetToken.findOneAndUpdate(
+        {},
+        tokens,
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      await MeetToken.deleteMany({ _id: { $ne: tokenDoc._id } });
       return { message: "Authorization successful! You can close this tab." };
     } catch (err) {
       console.error("Error retrieving access token", err);
