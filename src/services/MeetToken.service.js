@@ -42,7 +42,7 @@ const createMeetToken = async (data) => {
  */
 const generateMeetLink = async (data) => {
   return new Promise(async (resolve, reject) => {
-    const { summary, location, description, startDateTime, endDateTime, userId } = data;
+    const { summary, location, description, startDateTime, endDateTime, userId, timeZone } = data;
 
     // Build attendees list - add the meeting creator if userId is provided
     const attendees = [];
@@ -63,11 +63,11 @@ const generateMeetLink = async (data) => {
       description,
       start: {
         dateTime: startDateTime,
-        timeZone: "America/Los_Angeles",
+        timeZone: timeZone || "America/Los_Angeles",
       },
       end: {
         dateTime: endDateTime,
-        timeZone: "America/Los_Angeles",
+        timeZone: timeZone || "America/Los_Angeles",
       },
       conferenceData: {
         createRequest: {
@@ -108,7 +108,12 @@ const generateMeetLink = async (data) => {
             const meetLink = event.data.conferenceData.entryPoints.find(
               (entry) => entry.entryPointType === "video"
             )?.uri;
-            resolve({ meetLink });
+            resolve({
+              meetLink,
+              eventId: event.data.id,
+              calendarId: "primary",
+              htmlLink: event.data.htmlLink,
+            });
 
             // Only attempt to send emails if orderId is provided
             if (data?.orderId) {
@@ -144,6 +149,81 @@ ${meetLink}`;
           }
         );
       }
+    });
+  });
+};
+
+const updateMeetEvent = async (data) => {
+  return new Promise(async (resolve, reject) => {
+    const {
+      eventId,
+      calendarId = "primary",
+      summary,
+      location,
+      description,
+      startDateTime,
+      endDateTime,
+      timeZone,
+    } = data;
+
+    if (!eventId) {
+      reject(new Error("Google calendar event ID is required"));
+      return;
+    }
+
+    const eventPatch = {};
+
+    if (summary !== undefined) eventPatch.summary = summary;
+    if (location !== undefined) eventPatch.location = location;
+    if (description !== undefined) eventPatch.description = description;
+    if (startDateTime) {
+      eventPatch.start = {
+        dateTime: startDateTime,
+        timeZone: timeZone || "America/Los_Angeles",
+      };
+    }
+    if (endDateTime) {
+      eventPatch.end = {
+        dateTime: endDateTime,
+        timeZone: timeZone || "America/Los_Angeles",
+      };
+    }
+
+    authorize(async (auth, authUrl) => {
+      if (authUrl) {
+        resolve({ authUrl });
+        return;
+      }
+
+      const calendar = google.calendar({ version: "v3", auth });
+      calendar.events.patch(
+        {
+          auth,
+          calendarId,
+          eventId,
+          resource: eventPatch,
+          conferenceDataVersion: 1,
+          sendUpdates: "all",
+        },
+        (err, event) => {
+          if (err) {
+            console.error("Error updating event:", err);
+            reject(new Error("Error updating event: " + err.message));
+            return;
+          }
+
+          const meetLink = event.data.conferenceData?.entryPoints?.find(
+            (entry) => entry.entryPointType === "video"
+          )?.uri;
+
+          resolve({
+            meetLink,
+            eventId: event.data.id,
+            calendarId,
+            htmlLink: event.data.htmlLink,
+          });
+        }
+      );
     });
   });
 };
@@ -271,5 +351,6 @@ function formatDateTime(dateTimeString) {
 }
 module.exports = {
   createMeetToken,
+  updateMeetEvent,
   oauth2callback,
 };
