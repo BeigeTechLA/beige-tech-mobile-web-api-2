@@ -232,6 +232,7 @@ exports.createMeetEvent = async (req, res, next) => {
       description: req.body.description,
       startDateTime: req.body.startDateTime,
       endDateTime: req.body.endDateTime,
+      timeZone: req.body.timeZone,
       orderId: req.body.orderId,
       userId: req.body.userId || req.query.userId || getUserIdFromRequest(req),
     };
@@ -248,11 +249,45 @@ exports.createMeetEvent = async (req, res, next) => {
     }
 
     if (response?.meetLink) {
-      return res.status(httpStatus.CREATED).json({ meetLink: response.meetLink });
+      return res.status(httpStatus.CREATED).json(response);
     }
 
     if (response?.authUrl) {
       return res.status(httpStatus.OK).json({ authUrl: response.authUrl });
+    }
+
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, "Unexpected response from meet token service");
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.updateMeetEvent = async (req, res, next) => {
+  try {
+    const payload = {
+      eventId: req.body.eventId || req.body.googleCalendarEventId,
+      calendarId: req.body.calendarId || req.body.googleCalendarId || "primary",
+      summary: req.body.summary,
+      location: req.body.location,
+      description: req.body.description,
+      startDateTime: req.body.startDateTime,
+      endDateTime: req.body.endDateTime,
+      timeZone: req.body.timeZone,
+    };
+
+    let response = null;
+
+    if (EXTERNAL_MEETINGS_BASE_URL) {
+      response = await proxyExternalMeetingsRequest(req, "/update-event", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    } else {
+      response = await meetTokenService.updateMeetEvent(payload);
+    }
+
+    if (response?.meetLink || response?.eventId || response?.authUrl) {
+      return res.status(httpStatus.OK).json(response);
     }
 
     throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, "Unexpected response from meet token service");

@@ -2623,6 +2623,53 @@ exports.getFileViewUrl = async (req, res, next) => {
   }
 };
 
+exports.getFileViewUrlsBatch = async (req, res, next) => {
+  try {
+    const rawFilepaths = Array.isArray(req.body.filepaths) ? req.body.filepaths : [];
+    const filepaths = Array.from(
+      new Set(rawFilepaths.map((item) => normalizeWorkspacePath(item)).filter(Boolean))
+    ).slice(0, 50);
+
+    if (!filepaths.length) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "filepaths array is required",
+      });
+    }
+
+    const results = await Promise.all(
+      filepaths.map(async (filePath) => {
+        try {
+          const result = await gcpFileService.downloadFiles(
+            filePath.startsWith("Website_Shoots_Flow/")
+              ? filePath
+              : `Website_Shoots_Flow/${filePath}`,
+            false
+          );
+          return {
+            filepath: filePath,
+            success: true,
+            data: result,
+          };
+        } catch (error) {
+          return {
+            filepath: filePath,
+            success: false,
+            message: error.message || "Failed to generate view URL",
+          };
+        }
+      })
+    );
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: { files: results },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.getFileDownloadUrl = async (req, res, next) => {
   try {
     const filePath = normalizeWorkspacePath(req.body.filepath || req.query.filepath);
