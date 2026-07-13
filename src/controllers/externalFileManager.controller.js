@@ -1384,11 +1384,11 @@ const completeUploadMetadataForFile = async ({
   const cleanAuthorName = String(authorName || "Beige User").trim();
   const mongoUserId = toMongoUserIdOrNull(normalizedUserId);
 
-  if (!cleanPath || !normalizedUserId) {
+  if (!cleanPath) {
     return {
       ok: false,
       code: httpStatus.BAD_REQUEST,
-      error: "filepath and userId are required",
+      error: "filepath is required",
       filepath: cleanPath || String(filepath || ""),
     };
   }
@@ -1398,6 +1398,7 @@ const completeUploadMetadataForFile = async ({
     cpIds: parentFolder?.metadata?.cpIds || [],
     orderId: parentFolder?.metadata?.orderId || null,
     externalUserId: normalizedUserId,
+    uploadedByEmail: !normalizedUserId && cleanAuthorName.includes("@") ? cleanAuthorName : null,
   };
   const revisionVersionNumber = parseRevisionVersionNumber(cleanPath);
   const revisionUploadMetadata = revisionVersionNumber
@@ -1420,6 +1421,8 @@ const completeUploadMetadataForFile = async ({
       ...existingFile.metadata,
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      externalUserId: folderMetadata.externalUserId,
+      uploadedByEmail: folderMetadata.uploadedByEmail,
       ...revisionUploadMetadata,
     };
     // A file replaced at the same path belongs to the latest completed upload.
@@ -1440,7 +1443,7 @@ const completeUploadMetadataForFile = async ({
       cleanPath,
       fileName: existingFile.name || cleanFileName,
       uploadedByName: cleanAuthorName,
-      uploadedById: normalizedUserId,
+      uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
     });
 
     return {
@@ -1468,6 +1471,8 @@ const completeUploadMetadataForFile = async ({
     metadata: {
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      externalUserId: folderMetadata.externalUserId,
+      uploadedByEmail: folderMetadata.uploadedByEmail,
       ...revisionUploadMetadata,
     },
     createdAt: touchedAt,
@@ -1489,7 +1494,7 @@ const completeUploadMetadataForFile = async ({
     cleanPath,
     fileName: fileDoc.name || cleanFileName,
     uploadedByName: cleanAuthorName,
-    uploadedById: normalizedUserId,
+    uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
   });
 
   return {
