@@ -139,6 +139,103 @@ const downloadFolder = catchAsync(async (req, res, next) => {
   }
 });
 
+const normalizeZipFilePath = (value) => {
+  const normalized = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.startsWith("Website_Shoots_Flow/")
+    ? normalized
+    : `Website_Shoots_Flow/${normalized}`;
+};
+
+const SELECTED_ZIP_MAX_FILES = Math.max(1, Number(process.env.SELECTED_ZIP_MAX_FILES || 100));
+const SELECTED_ZIP_MAX_BYTES = Math.max(
+  1,
+  Number(process.env.SELECTED_ZIP_MAX_BYTES || 5 * 1024 * 1024 * 1024)
+);
+
+const getZipEntryName = (filePath, index) => {
+  const parts = String(filePath || "").split("/").filter(Boolean);
+  const filename = parts[parts.length - 1] || `file-${index + 1}`;
+  return filename.replace(/[<>:"\\|?*\x00-\x1F]/g, "_");
+};
+
+const downloadSelectedFiles = catchAsync(async (req, res, next) => {
+  const rawFilepaths = Array.isArray(req.body.filepaths) ? req.body.filepaths : [];
+  const filepaths = Array.from(new Set(rawFilepaths.map(normalizeZipFilePath).filter(Boolean)));
+
+  if (!filepaths.length) {
+    return res.status(400).json({ success: false, message: "filepaths array is required" });
+  }
+
+  if (filepaths.length > SELECTED_ZIP_MAX_FILES) {
+    return res.status(413).json({
+      success: false,
+      message: `Please select ${SELECTED_ZIP_MAX_FILES} files or fewer at a time`,
+    });
+  }
+
+  try {
+    const files = [];
+    let totalSize = 0;
+
+    for (const filepath of filepaths) {
+      const file = gcpFileService.bucket.file(filepath);
+      const [exists] = await file.exists();
+      if (!exists) {
+        return res.status(404).json({ success: false, message: `File not found: ${filepath}` });
+      }
+
+      const [metadata] = await file.getMetadata();
+      totalSize += parseInt(metadata?.size || 0, 10);
+      if (totalSize > SELECTED_ZIP_MAX_BYTES) {
+        return res.status(413).json({
+          success: false,
+          message: "Selected files are too large to download together. Please download fewer files.",
+        });
+      }
+      files.push(file);
+    }
+
+    const archiveName = String(req.body.filename || "selected-files")
+      .replace(/\.zip$/i, "")
+      .replace(/[<>:"\\|?*\x00-\x1F]/g, "_")
+      .trim() || "selected-files";
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${archiveName}.zip"`);
+    res.setHeader("X-Total-Size", totalSize.toString());
+
+    const archive = archiver("zip", {
+      store: true,
+      zlib: { level: 0 },
+    });
+
+    archive.on("error", (err) => {
+      console.error("Selected files archive error:", err);
+      if (!res.headersSent) {
+        res.status(500).send("Internal Server Error");
+      } else {
+        res.end();
+      }
+    });
+
+    archive.pipe(res);
+
+    files.forEach((file, index) => {
+      archive.append(file.createReadStream(), { name: getZipEntryName(file.name, index) });
+    });
+
+    await archive.finalize();
+  } catch (error) {
+    console.error("Error in downloadSelectedFiles:", error);
+    next(error);
+  }
+});
+
 // set public
 const setPublic = catchAsync(async (req, res, next) => {
   try {
@@ -1658,6 +1755,7 @@ module.exports = {
   getFiles,
   getChatFiles,
   downloadFolder,
+  downloadSelectedFiles,
   setPublic,
   setPrivate,
   getShareUrl,
