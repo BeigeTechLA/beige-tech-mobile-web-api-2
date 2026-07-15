@@ -410,30 +410,49 @@ const toMongoUserIdOrNull = (value) => {
 const getParentFolderMetadata = async (cleanPath) => {
   const pathParts = cleanPath.split("/").filter(Boolean);
   if (pathParts.length <= 1) {
-    return { parentFolder: null };
+    return { parentFolder: null, canonicalFolderPath: "" };
   }
 
   const folderPath = `${pathParts.slice(0, -1).join("/")}/`;
+  const folderPathWithoutTrailingSlash = folderPath.replace(/\/+$/, "");
   const cacheKey = folderPath.toLowerCase();
   const now = Date.now();
   const cached = parentFolderMetaCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return { parentFolder: cached.parentFolder };
+    return {
+      parentFolder: cached.parentFolder,
+      canonicalFolderPath: cached.canonicalFolderPath,
+    };
   }
 
-  const parentFolder = await FileMeta.findOne({
-    path: folderPath,
+  let parentFolder = await FileMeta.findOne({
+    path: { $in: [folderPath, folderPathWithoutTrailingSlash] },
     isFolder: true,
   })
     .select("_id path userId metadata")
     .lean();
 
+  if (!parentFolder) {
+    parentFolder = await FileMeta.findOne({
+      path: { $regex: `^${escapeRegex(folderPathWithoutTrailingSlash)}\\/?$`, $options: "i" },
+      isFolder: true,
+    })
+      .select("_id path userId metadata")
+      .sort({ updatedAt: -1 })
+      .lean();
+  }
+
+  const canonicalFolderPath = parentFolder?.path
+    ? `${String(parentFolder.path).replace(/\/+$/, "")}/`
+    : folderPath;
+
   parentFolderMetaCache.set(cacheKey, {
     parentFolder: parentFolder || null,
+    canonicalFolderPath,
     expiresAt: now + PARENT_FOLDER_CACHE_TTL_MS,
   });
 
-  return { parentFolder };
+  return { parentFolder, canonicalFolderPath };
 };
 
 const resolveWorkspaceBasePath = (workspacePath, phase, subPath) => {
@@ -1326,7 +1345,7 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
-  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  const { parentFolder, canonicalFolderPath } = await getParentFolderMetadata(cleanPath);
   if (!parentFolder) {
     return {
       ok: false,
@@ -1336,8 +1355,10 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
-  if (parseRevisionVersionNumber(cleanPath)) {
-    const existingRevisionFile = await FileMeta.findOne({ path: cleanPath, isFolder: false })
+  const canonicalCleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
+
+  if (parseRevisionVersionNumber(canonicalCleanPath)) {
+    const existingRevisionFile = await FileMeta.findOne({ path: canonicalCleanPath, isFolder: false })
       .select("_id metadata")
       .lean();
     if (existingRevisionFile) {
@@ -1345,13 +1366,13 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
         ok: false,
         code: httpStatus.CONFLICT,
         error: "This version is already uploaded. Ask the client to request a revision before uploading the next version.",
-        filepath: cleanPath,
+        filepath: canonicalCleanPath,
       };
     }
   }
 
   const result = await gcpFileService.uploadFile(
-    `Website_Shoots_Flow/${cleanPath}`.replace(/\/+/g, "/"),
+    `Website_Shoots_Flow/${canonicalCleanPath}`.replace(/\/+/g, "/"),
     cleanContentType,
     normalizedFileSize,
     normalizedUserId,
@@ -1362,7 +1383,7 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
 
   return {
     ok: true,
-    filepath: cleanPath,
+    filepath: canonicalCleanPath,
     data: result,
   };
 };
@@ -1376,10 +1397,9 @@ const completeUploadMetadataForFile = async ({
   authorName,
   providerTimeoutMs,
 }) => {
-  const cleanPath = normalizeWorkspacePath(filepath);
+  let cleanPath = normalizeWorkspacePath(filepath);
   const cleanContentType = String(fileContentType || "application/octet-stream").trim();
   const normalizedFileSize = Number(fileSize || 0);
-  const cleanFileName = String(fileName || cleanPath.split("/").pop() || "").trim();
   const normalizedUserId = userId ? String(userId).trim() : null;
   const cleanAuthorName = String(authorName || "Beige User").trim();
   const mongoUserId = toMongoUserIdOrNull(normalizedUserId);
@@ -1393,7 +1413,11 @@ const completeUploadMetadataForFile = async ({
     };
   }
 
-  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  const { parentFolder, canonicalFolderPath } = await getParentFolderMetadata(cleanPath);
+  if (parentFolder && canonicalFolderPath) {
+    cleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
+  }
+  const cleanFileName = String(fileName || cleanPath.split("/").pop() || "").trim();
   const folderMetadata = {
     cpIds: parentFolder?.metadata?.cpIds || [],
     orderId: parentFolder?.metadata?.orderId || null,
