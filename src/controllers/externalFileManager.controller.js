@@ -406,6 +406,22 @@ const normalizeWorkspacePath = (value) => {
   return normalized;
 };
 
+const canonicalizeWorkflowPath = (value) => {
+  const normalized = normalizeWorkspacePath(value);
+  if (!normalized) return "";
+
+  return normalized
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => {
+      const normalizedSegment = normalizeFolderSegment(segment);
+      if (normalizedSegment === "preproduction") return "Pre-Production";
+      if (normalizedSegment === "postproduction") return "Post-Production";
+      return segment;
+    })
+    .join("/");
+};
+
 const toMongoUserIdOrNull = (value) => {
   const normalized = String(value || "").trim();
   if (!normalized) return null;
@@ -1450,7 +1466,7 @@ exports.createFolder = async (req, res, next) => {
 };
 
 const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId }) => {
-  const cleanPath = normalizeWorkspacePath(filepath);
+  const cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "").trim();
   const normalizedFileSize = Number(fileSize || 0);
   const normalizedUserId = userId ? String(userId).trim() : null;
@@ -1516,7 +1532,7 @@ const completeUploadMetadataForFile = async ({
   authorName,
   providerTimeoutMs,
 }) => {
-  let cleanPath = normalizeWorkspacePath(filepath);
+  let cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "application/octet-stream").trim();
   const normalizedFileSize = Number(fileSize || 0);
   const normalizedUserId = userId ? String(userId).trim() : null;
