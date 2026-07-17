@@ -5,7 +5,7 @@
 
 const logger = require("../config/logger");
 const { FcmToken } = require("../models");
-const firebase = require("../utils/Firebase");
+const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
 const ApiError = require("../utils/ApiError");
 const httpStatus = require("http-status");
 // Removed to fix circular dependency
@@ -19,30 +19,128 @@ const httpStatus = require("http-status");
  * @param {string} registrationToken - The FCM registration token to be saved.
  * @returns {Promise<boolean>} A promise that resolves to true if the token was saved successfully, or false otherwise.
  */
-const saveFCMToken = async (userId, registrationToken) => {
+const normalizeString = (value) => {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text || null;
+};
+
+const normalizeDeviceType = (value) => {
+  const deviceType = normalizeString(value)?.toLowerCase();
+  return ['android', 'ios', 'web'].includes(deviceType) ? deviceType : 'android';
+};
+
+const NOTIFICATION_TOPICS = new Set([
+  'shoots',
+  'payments',
+  'messages',
+  'meetings',
+  'proposals',
+  'files',
+  'system',
+]);
+
+const normalizeTopic = (value) => {
+  const topic = normalizeString(value)?.toLowerCase();
+  return NOTIFICATION_TOPICS.has(topic) ? topic : 'system';
+};
+
+const normalizeNotificationPreferences = (preferences = {}) => {
+  const sourceTopics = preferences.topics || preferences.categories || {};
+  const normalizedTopics = {};
+
+  for (const topic of NOTIFICATION_TOPICS) {
+    if (typeof sourceTopics[topic] === 'boolean') {
+      normalizedTopics[topic] = sourceTopics[topic];
+    }
+  }
+
+  const normalized = {};
+
+  if (typeof preferences.push_enabled === 'boolean') {
+    normalized.push_enabled = preferences.push_enabled;
+  }
+
+  if (Object.keys(normalizedTopics).length) {
+    normalized.topics = normalizedTopics;
+  }
+
+  return normalized;
+};
+
+const isPushAllowedForToken = (tokenRecord, topic) => {
+  const preferences = tokenRecord.notification_preferences || {};
+  if (preferences.push_enabled === false) return false;
+
+  const topics = preferences.topics || {};
+  if (topics[topic] === false) return false;
+
+  return true;
+};
+
+const saveFCMToken = async (userId, registrationToken, options = {}) => {
   try {
-    // Find the user's FCM tokens from the database
-    let tokensRecord = await FcmToken.findOne({ user: userId });
+    const fcmToken = normalizeString(registrationToken || options.fcm_token);
+    const sessionId = normalizeString(options.session_id);
+    const notificationPreferences = normalizeNotificationPreferences(options.notification_preferences || {});
 
-    // If no record exists, create a new one
-    if (!tokensRecord) {
-      tokensRecord = new FcmToken({ user: userId, tokens: [] });
+    if (!userId || !fcmToken) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken are required");
     }
 
-    // Check if the token is already saved
-    if (!tokensRecord.tokens.includes(registrationToken)) {
-      // Add the new token to the tokens array
-      tokensRecord.tokens.push(registrationToken);
-      await tokensRecord.save();
-      logger.info(`FCM token saved for user ${userId}`);
-    } else {
-      const conflictMessage = `FCM token already exists for user ${userId}`;
-      logger.warn(conflictMessage);
-      throw new ApiError(httpStatus.CONFLICT, conflictMessage);
+    const payload = {
+      user_id: userId,
+      fcm_token: fcmToken,
+      session_id: sessionId,
+      device_type: normalizeDeviceType(options.device_type),
+      app_user_type: normalizeString(options.app_user_type),
+      is_active: true,
+      last_used_at: new Date(),
+    };
+
+    if (Object.keys(notificationPreferences).length) {
+      payload.notification_preferences = notificationPreferences;
     }
+
+    const tokensRecord = await FcmToken.findOneAndUpdate(
+      sessionId ? { user_id: userId, session_id: sessionId } : { fcm_token: fcmToken },
+      { $set: payload },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    logger.info(`FCM token saved for user ${userId}`);
     return tokensRecord;
   } catch (error) {
     logger.error("Error saving FCM token:", error);
+    throw error;
+  }
+};
+
+const removeFCMToken = async (userId, registrationToken, options = {}) => {
+  try {
+    const fcmToken = normalizeString(registrationToken);
+    const sessionId = normalizeString(options.session_id);
+
+    if (!userId || (!fcmToken && !sessionId)) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken or session_id are required");
+    }
+
+    await FcmToken.updateOne(
+      sessionId
+        ? { user_id: userId, session_id: sessionId }
+        : { user_id: userId, fcm_token: fcmToken },
+      {
+        $set: {
+          is_active: false,
+          last_used_at: new Date(),
+        },
+      }
+    );
+
+    logger.info(`FCM token removed for user ${userId}`);
+    return true;
+  } catch (error) {
+    logger.error("Error removing FCM token:", error);
     throw error;
   }
 };
@@ -54,28 +152,22 @@ const saveFCMToken = async (userId, registrationToken) => {
  * @param {string} userId - The ID of the user for whom to fetch FCM tokens.
  * @returns {Array<string> | false} An array of FCM tokens for the user, or false if no tokens are found.
  */
-const getTokensByUserId = async (userId) => {
+const getTokenRecordsByUserId = async (userId) => {
   try {
-    // Find the user's FCM tokens from the database
-    const tokensRecord = await FcmToken.findOne({ user: userId });
-
-    // Check if FCM tokens are found for the user
-    if (
-      !tokensRecord ||
-      !tokensRecord.tokens ||
-      tokensRecord.tokens.length === 0
-    ) {
-      // No FCM tokens found for the user, return false
-      return false;
-    }
-
-    // Return the recipient FCM tokens
-    return tokensRecord.tokens;
+    return FcmToken.find({
+      user_id: userId,
+      is_active: true,
+    }).select('fcm_token notification_preferences');
   } catch (error) {
-    // Handle errors gracefully and log them
     logger.error(`Error fetching FCM tokens for user ${userId}: ${error}`);
-    return false;
+    return [];
   }
+};
+
+const getTokensByUserId = async (userId) => {
+  const tokenRecords = await getTokenRecordsByUserId(userId);
+  if (!tokenRecords.length) return false;
+  return tokenRecords.map((record) => record.fcm_token).filter(Boolean);
 };
 
 /**
@@ -110,42 +202,54 @@ const logMessageDeliveryStatus = (response) => {
 const sendNotification = async (userId, title, content, customData) => {
   return new Promise(async (resolve, reject) => {
     try {
-      // Delete inactive tokens before sending notifications
-      await deleteInactiveTokens(userId);
+      const recipientTokenRecords = await getTokenRecordsByUserId(userId);
+      const topic = normalizeTopic(customData?.topic || customData?.category || customData?.type);
+      const allowedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
+        isPushAllowedForToken(tokenRecord, topic)
+      ));
 
-      // Get the recipient FCM tokens
-      const recipientTokens = await getTokensByUserId(userId);
-
-      if (!recipientTokens) {
-        // No tokens found for the user, handle accordingly
-        // logger.warn(`No FCM tokens found for user ${userId}`);
+      if (!allowedTokenRecords.length) {
         resolve(false);
         return;
       }
 
-      // Prepare the notification message payload with custom data
-      const notificationMessagePayload = {
-        tokens: recipientTokens,
-        notification: {
-          title: title,
-          body: content,
-        },
-        data: customData, // Include custom data here
-      };
+      const sendResults = await Promise.all(
+        allowedTokenRecords.map(async (tokenRecord) => {
+          try {
+            await sendFcmHttpV1Message({
+              token: tokenRecord.fcm_token,
+              title,
+              body: content,
+              data: customData,
+            });
+            return { success: true, tokenRecord };
+          } catch (error) {
+            return { success: false, tokenRecord, error };
+          }
+        })
+      );
 
-      // Prepare the data message payload with custom data
-      const dataMessagePayload = {
-        tokens: recipientTokens,
-        data: customData,
-      };
+      const invalidTokenIds = sendResults
+        .filter((result) => result.error?.isPermanentTokenError)
+        .map((result) => result.tokenRecord._id);
 
-      await Promise.all([
-        // Send data message to multiple devices using sendMulticast method
-        firebase.messaging().sendEachForMulticast(dataMessagePayload),
-        // Send notifications message to multiple devices using sendMulticast method
-        firebase.messaging().sendEachForMulticast(notificationMessagePayload),
-      ]);
-      resolve(true);
+      if (invalidTokenIds.length) {
+        await FcmToken.updateMany(
+          { _id: { $in: invalidTokenIds } },
+          {
+            $set: {
+              is_active: false,
+              last_used_at: new Date(),
+            },
+          }
+        );
+      }
+
+      const successCount = sendResults.filter((result) => result.success).length;
+      const failureCount = sendResults.length - successCount;
+      logMessageDeliveryStatus({ successCount, failureCount });
+
+      resolve(successCount > 0);
       // await createNotificationFromFcm(userId, title, content, customData);
     } catch (error) {
       // Handle any errors that occur during the notification sending process
@@ -162,65 +266,8 @@ const sendNotification = async (userId, title, content, customData) => {
  * @param {string} token - The FCM registration token to test.
  * @returns {Promise<boolean>} A promise that resolves to true if the token is valid and active, or false otherwise.
  */
-const checkToken = async (token) => {
-  const message = {
-    data: {
-      operation: "Token Test",
-    },
-    token: token,
-  };
-
-  try {
-    // Send a test message to the token and resolve to true if successful
-    await firebase.messaging().send(message);
-    return true;
-  } catch (error) {
-    if (error.code === "messaging/invalid-registration-token") {
-      logger.error("Invalid token:", error);
-      return false;
-    }
-    logger.error("FCM Service checkToken error: ", error);
-  }
-};
-
-/**
- * Delete Inactive Tokens
- * Deletes inactive tokens from the user's FCM tokens record in the database.
- *
- * @param {string} userId - The ID of the user for whom to delete inactive tokens.
- * @returns {Promise<boolean>} A promise that resolves to true if the operation was successful, or false otherwise.
- */
-const deleteInactiveTokens = async (userId) => {
-  try {
-    const recipientTokens = await getTokensByUserId(userId);
-
-    if (!recipientTokens) {
-      // No tokens found for the user, nothing to delete
-      return true;
-    }
-
-    const activeTokens = await Promise.all(
-      recipientTokens.map((token) => checkToken(token))
-    );
-
-    const activeRecipientTokens = recipientTokens.filter(
-      (token, index) => activeTokens[index]
-    );
-
-    const tokensRecord = await FcmToken.findOne({ user: userId });
-    if (tokensRecord) {
-      tokensRecord.tokens = activeRecipientTokens;
-      await tokensRecord.save();
-    }
-
-    return true;
-  } catch (error) {
-    logger.error("Error deleting inactive tokens:", error);
-    return false;
-  }
-};
-
 module.exports = {
   saveFCMToken,
+  removeFCMToken,
   sendNotification,
 };

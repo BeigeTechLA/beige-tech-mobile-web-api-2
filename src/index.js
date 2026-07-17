@@ -6,6 +6,7 @@ const http = require("http");
 const cron = require("node-cron");
 const { startSocketServer } = require("./services/socket.service");
 const { checkAndReassignPendingOrders, updateOrderStatusByShootDate } = require("./services/cron.service");
+const { startFirebaseAccessTokenRefreshScheduler } = require("./helpers/firebase-auth.helper");
 
 //Create socket io and initialize server
 let server = http.createServer(app);
@@ -20,6 +21,7 @@ mongoose.connect(config.mongoose.url, config.mongoose.options).then(() => {
   server.listen(config.port, '0.0.0.0', () => {
     logger.info(`Listening to port ${config.port} on all network interfaces (LAN accessible)`);
   });
+  startFirebaseAccessTokenRefreshScheduler();
 
   // Initialize cron jobs
   // Run every hour to check for orders with pending CPs that haven't accepted within 3 hours
