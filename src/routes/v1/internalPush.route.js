@@ -8,6 +8,7 @@ router.use(internalApiKey);
 
 router.post('/tokens', internalPushController.saveToken);
 router.delete('/tokens', internalPushController.removeToken);
+router.patch('/preferences', internalPushController.updatePreferences);
 router.post('/send', internalPushController.sendNotification);
 
 module.exports = router;

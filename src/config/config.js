@@ -59,6 +59,15 @@ const envVarsSchema = Joi.object()
     FIREBASE_PROJECT_KEY: Joi.string().description(
       "Firebase project config key for FCM HTTP v1"
     ),
+    FIREBASE_PROJECTS_JSON: Joi.string().description(
+      "JSON Firebase project mappings for FCM HTTP v1"
+    ),
+    FIREBASE_APP_USER_TYPE: Joi.string().description(
+      "Fallback app user type for single Firebase project config"
+    ),
+    FIREBASE_DEVICE_TYPES: Joi.string().description(
+      "Fallback comma-separated device types for single Firebase project config"
+    ),
     FIREBASE_PROJECT_ID: Joi.string().description(
       "Firebase project id for FCM HTTP v1"
     ),

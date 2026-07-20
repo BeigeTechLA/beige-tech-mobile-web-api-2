@@ -6,6 +6,7 @@
 const logger = require("../config/logger");
 const { FcmToken } = require("../models");
 const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
+const { getFirebaseProjectForToken } = require("../config/firebase-http");
 const ApiError = require("../utils/ApiError");
 const httpStatus = require("http-status");
 // Removed to fix circular dependency
@@ -145,6 +146,46 @@ const removeFCMToken = async (userId, registrationToken, options = {}) => {
   }
 };
 
+const updateNotificationPreferences = async (userId, options = {}) => {
+  try {
+    const sessionId = normalizeString(options.session_id);
+    const notificationPreferences = normalizeNotificationPreferences(options.notification_preferences || {});
+
+    if (!userId || !sessionId) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "userId and session_id are required");
+    }
+
+    if (!Object.keys(notificationPreferences).length) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "notification_preferences is required");
+    }
+
+    const updatedToken = await FcmToken.findOneAndUpdate(
+      {
+        user_id: userId,
+        session_id: sessionId,
+        is_active: true,
+      },
+      {
+        $set: {
+          notification_preferences: notificationPreferences,
+          last_used_at: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!updatedToken) {
+      throw new ApiError(httpStatus.NOT_FOUND, "Active FCM session not found");
+    }
+
+    logger.info(`FCM notification preferences updated for user ${userId}`);
+    return updatedToken;
+  } catch (error) {
+    logger.error("Error updating FCM notification preferences:", error);
+    throw error;
+  }
+};
+
 /**
  * Get Tokens By User ID
  * Fetches the FCM tokens associated with a user from the database.
@@ -157,7 +198,7 @@ const getTokenRecordsByUserId = async (userId) => {
     return FcmToken.find({
       user_id: userId,
       is_active: true,
-    }).select('fcm_token notification_preferences');
+    }).select('fcm_token app_user_type device_type notification_preferences');
   } catch (error) {
     logger.error(`Error fetching FCM tokens for user ${userId}: ${error}`);
     return [];
@@ -216,11 +257,17 @@ const sendNotification = async (userId, title, content, customData) => {
       const sendResults = await Promise.all(
         allowedTokenRecords.map(async (tokenRecord) => {
           try {
+            const firebaseProject = getFirebaseProjectForToken({
+              appUserType: tokenRecord.app_user_type,
+              deviceType: tokenRecord.device_type,
+            });
+
             await sendFcmHttpV1Message({
               token: tokenRecord.fcm_token,
               title,
               body: content,
               data: customData,
+              projectKey: firebaseProject.key,
             });
             return { success: true, tokenRecord };
           } catch (error) {
@@ -269,5 +316,6 @@ const sendNotification = async (userId, title, content, customData) => {
 module.exports = {
   saveFCMToken,
   removeFCMToken,
+  updateNotificationPreferences,
   sendNotification,
 };

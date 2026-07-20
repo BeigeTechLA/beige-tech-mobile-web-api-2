@@ -5,10 +5,10 @@ const logger = require('../config/logger');
 const ApiError = require('../utils/ApiError');
 const { FirebaseHttpAccessToken } = require('../models');
 const {
-  FCM_SCOPE,
   GOOGLE_OAUTH_TOKEN_URL,
   DEFAULT_PROJECT_KEY,
-  getFirebaseProject,
+  FCM_SCOPE,
+  getFirebaseProjects,
 } = require('../config/firebase-http');
 
 const REFRESH_INTERVAL_MS = 58 * 60 * 1000;
@@ -54,8 +54,7 @@ const requestGoogleAccessToken = async (project) => {
   };
 };
 
-const refreshFirebaseAccessToken = async () => {
-  const project = getFirebaseProject();
+const refreshFirebaseAccessToken = async (project) => {
   const tokenResponse = await requestGoogleAccessToken(project);
 
   if (!tokenResponse.accessToken) {
@@ -95,9 +94,20 @@ const getValidStoredAccessToken = async (projectKey = DEFAULT_PROJECT_KEY) => {
 };
 
 const startFirebaseAccessTokenRefreshScheduler = async () => {
+  const refreshAllProjects = async () => {
+    const projects = getFirebaseProjects();
+    for (const project of projects) {
+      try {
+        await refreshFirebaseAccessToken(project);
+        logger.info(`Firebase HTTP v1 access token refreshed for ${project.key}`);
+      } catch (error) {
+        logger.error(`Firebase HTTP v1 token refresh failed for ${project.key}: ${error.message}`);
+      }
+    }
+  };
+
   try {
-    await refreshFirebaseAccessToken();
-    logger.info('Firebase HTTP v1 access token refreshed on startup');
+    await refreshAllProjects();
   } catch (error) {
     logger.error(`Firebase HTTP v1 startup token refresh failed: ${error.message}`);
   }
@@ -106,8 +116,7 @@ const startFirebaseAccessTokenRefreshScheduler = async () => {
 
   refreshTimer = setInterval(async () => {
     try {
-      await refreshFirebaseAccessToken();
-      logger.info('Firebase HTTP v1 access token refreshed by scheduler');
+      await refreshAllProjects();
     } catch (error) {
       logger.error(`Firebase HTTP v1 scheduled token refresh failed: ${error.message}`);
     }

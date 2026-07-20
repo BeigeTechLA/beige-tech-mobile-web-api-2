@@ -1,6 +1,5 @@
 const axios = require('axios');
 const httpStatus = require('http-status');
-const { DEFAULT_PROJECT_KEY } = require('../config/firebase-http');
 const { getValidStoredAccessToken } = require('./firebase-auth.helper');
 const { buildFcmHttpV1Payload } = require('./notification-payload.helper');
 
@@ -22,7 +21,7 @@ const isPermanentTokenError = (errorData = {}) => {
   return code === 'INVALID_ARGUMENT' && message.includes('token');
 };
 
-const sendFcmHttpV1Message = async ({ token, title, body, data = {}, projectKey = DEFAULT_PROJECT_KEY }) => {
+const sendFcmHttpV1Message = async ({ token, title, body, data = {}, projectKey }) => {
   const tokenRecord = await getValidStoredAccessToken(projectKey);
   const payload = buildFcmHttpV1Payload({ token, title, body, data });
 
