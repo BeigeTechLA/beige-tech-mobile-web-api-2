@@ -4,9 +4,9 @@ const {toJSON} = require('./plugins');
 const tokenSchema = mongoose.Schema(
     {
         user_id: {
-            type: mongoose.SchemaTypes.ObjectId,
-            ref: 'User',
+            type: String,
             required: true,
+            trim: true,
         },
         fcm_token: {
             type: String,

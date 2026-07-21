@@ -31,16 +31,14 @@ const updatePreferences = catchAsync(async (req, res) => {
 });
 
 const sendNotification = catchAsync(async (req, res) => {
-  const sent = await fcmService.sendNotification(
+  const result = await fcmService.sendNotification(
     req.body.user_id,
     req.body.title,
     req.body.body,
     req.body.data || {}
   );
 
-  res.status(httpStatus.OK).send({
-    success: sent,
-  });
+  res.status(httpStatus.OK).send(result);
 });
 
 module.exports = {

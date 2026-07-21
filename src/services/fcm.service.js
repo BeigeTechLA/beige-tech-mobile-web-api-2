@@ -81,16 +81,17 @@ const isPushAllowedForToken = (tokenRecord, topic) => {
 
 const saveFCMToken = async (userId, registrationToken, options = {}) => {
   try {
+    const normalizedUserId = normalizeString(userId);
     const fcmToken = normalizeString(registrationToken || options.fcm_token);
     const sessionId = normalizeString(options.session_id);
     const notificationPreferences = normalizeNotificationPreferences(options.notification_preferences || {});
 
-    if (!userId || !fcmToken) {
+    if (!normalizedUserId || !fcmToken) {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken are required");
     }
 
     const payload = {
-      user_id: userId,
+      user_id: normalizedUserId,
       fcm_token: fcmToken,
       session_id: sessionId,
       device_type: normalizeDeviceType(options.device_type),
@@ -104,12 +105,12 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     const tokensRecord = await FcmToken.findOneAndUpdate(
-      sessionId ? { user_id: userId, session_id: sessionId } : { fcm_token: fcmToken },
+      sessionId ? { user_id: normalizedUserId, session_id: sessionId } : { fcm_token: fcmToken },
       { $set: payload },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
-    logger.info(`FCM token saved for user ${userId}`);
+    logger.info(`FCM token saved for user ${normalizedUserId}`);
     return tokensRecord;
   } catch (error) {
     logger.error("Error saving FCM token:", error);
@@ -119,17 +120,18 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
 
 const removeFCMToken = async (userId, registrationToken, options = {}) => {
   try {
+    const normalizedUserId = normalizeString(userId);
     const fcmToken = normalizeString(registrationToken);
     const sessionId = normalizeString(options.session_id);
 
-    if (!userId || (!fcmToken && !sessionId)) {
+    if (!normalizedUserId || (!fcmToken && !sessionId)) {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken or session_id are required");
     }
 
     await FcmToken.updateOne(
       sessionId
-        ? { user_id: userId, session_id: sessionId }
-        : { user_id: userId, fcm_token: fcmToken },
+        ? { user_id: normalizedUserId, session_id: sessionId }
+        : { user_id: normalizedUserId, fcm_token: fcmToken },
       {
         $set: {
           is_active: false,
@@ -138,7 +140,7 @@ const removeFCMToken = async (userId, registrationToken, options = {}) => {
       }
     );
 
-    logger.info(`FCM token removed for user ${userId}`);
+    logger.info(`FCM token removed for user ${normalizedUserId}`);
     return true;
   } catch (error) {
     logger.error("Error removing FCM token:", error);
@@ -148,10 +150,11 @@ const removeFCMToken = async (userId, registrationToken, options = {}) => {
 
 const updateNotificationPreferences = async (userId, options = {}) => {
   try {
+    const normalizedUserId = normalizeString(userId);
     const sessionId = normalizeString(options.session_id);
     const notificationPreferences = normalizeNotificationPreferences(options.notification_preferences || {});
 
-    if (!userId || !sessionId) {
+    if (!normalizedUserId || !sessionId) {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and session_id are required");
     }
 
@@ -161,7 +164,7 @@ const updateNotificationPreferences = async (userId, options = {}) => {
 
     const updatedToken = await FcmToken.findOneAndUpdate(
       {
-        user_id: userId,
+        user_id: normalizedUserId,
         session_id: sessionId,
         is_active: true,
       },
@@ -178,7 +181,7 @@ const updateNotificationPreferences = async (userId, options = {}) => {
       throw new ApiError(httpStatus.NOT_FOUND, "Active FCM session not found");
     }
 
-    logger.info(`FCM notification preferences updated for user ${userId}`);
+    logger.info(`FCM notification preferences updated for user ${normalizedUserId}`);
     return updatedToken;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
@@ -195,10 +198,13 @@ const updateNotificationPreferences = async (userId, options = {}) => {
  */
 const getTokenRecordsByUserId = async (userId) => {
   try {
+    const normalizedUserId = normalizeString(userId);
+    if (!normalizedUserId) return [];
+
     return FcmToken.find({
-      user_id: userId,
+      user_id: normalizedUserId,
       is_active: true,
-    }).select('fcm_token app_user_type device_type notification_preferences');
+    }).select('fcm_token session_id app_user_type device_type notification_preferences');
   } catch (error) {
     logger.error(`Error fetching FCM tokens for user ${userId}: ${error}`);
     return [];
@@ -241,16 +247,32 @@ const logMessageDeliveryStatus = (response) => {
  * @throws {Error} If there's a critical error during the notification sending process, this function may throw an error.
  */
 const sendNotification = async (userId, title, content, customData) => {
-  return new Promise(async (resolve, reject) => {
+  return new Promise(async (resolve) => {
     try {
+      const normalizedUserId = normalizeString(userId);
       const recipientTokenRecords = await getTokenRecordsByUserId(userId);
       const topic = normalizeTopic(customData?.topic || customData?.category || customData?.type);
       const allowedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
         isPushAllowedForToken(tokenRecord, topic)
       ));
+      const blockedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
+        !isPushAllowedForToken(tokenRecord, topic)
+      ));
 
       if (!allowedTokenRecords.length) {
-        resolve(false);
+        resolve({
+          success: false,
+          debug: {
+            user_id: normalizedUserId,
+            topic,
+            active_token_count: recipientTokenRecords.length,
+            preference_allowed_token_count: 0,
+            preference_blocked_token_count: blockedTokenRecords.length,
+            reason: recipientTokenRecords.length
+              ? 'PUSH_DISABLED_BY_SESSION_PREFERENCES'
+              : 'NO_ACTIVE_FCM_TOKENS_FOR_USER',
+          },
+        });
         return;
       }
 
@@ -269,7 +291,11 @@ const sendNotification = async (userId, title, content, customData) => {
               data: customData,
               projectKey: firebaseProject.key,
             });
-            return { success: true, tokenRecord };
+            return {
+              success: true,
+              tokenRecord,
+              projectKey: firebaseProject.key,
+            };
           } catch (error) {
             return { success: false, tokenRecord, error };
           }
@@ -296,12 +322,44 @@ const sendNotification = async (userId, title, content, customData) => {
       const failureCount = sendResults.length - successCount;
       logMessageDeliveryStatus({ successCount, failureCount });
 
-      resolve(successCount > 0);
+      resolve({
+        success: successCount > 0,
+        debug: {
+          user_id: normalizedUserId,
+          topic,
+          active_token_count: recipientTokenRecords.length,
+          preference_allowed_token_count: allowedTokenRecords.length,
+          preference_blocked_token_count: blockedTokenRecords.length,
+          success_count: successCount,
+          failure_count: failureCount,
+          failures: sendResults
+            .filter((result) => !result.success)
+            .map((result) => ({
+              token_id: result.tokenRecord?._id ? String(result.tokenRecord._id) : null,
+              session_id: result.tokenRecord?.session_id || null,
+              app_user_type: result.tokenRecord?.app_user_type || null,
+              device_type: result.tokenRecord?.device_type || null,
+              error_message: result.error?.message || null,
+              firebase_error_code: result.error?.firebaseErrorCode || null,
+              error_code: result.error?.code || null,
+              http_code: result.error?.httpCode || null,
+              is_permanent_token_error: !!result.error?.isPermanentTokenError,
+            })),
+        },
+      });
       // await createNotificationFromFcm(userId, title, content, customData);
     } catch (error) {
       // Handle any errors that occur during the notification sending process
       logger.error("Error sending notifications:", error);
-      resolve(false); // Resolve to false if there's an error
+      resolve({
+        success: false,
+        debug: {
+          user_id: normalizeString(userId),
+          reason: 'SEND_NOTIFICATION_EXCEPTION',
+          error_message: error.message || String(error),
+          error_code: error.code || null,
+        },
+      });
     }
   });
 };
