@@ -17,6 +17,31 @@ const normalizeParticipantId = (value) => {
   return id || null;
 };
 
+const getParticipantNotificationIds = (value) => {
+  if (!value) return [];
+
+  if (typeof value === "string" || typeof value === "number") {
+    const id = String(value).trim();
+    return id ? [id] : [];
+  }
+
+  const ids = [
+    value.id,
+    value._id,
+    value.user_id,
+    value.userId,
+    value.client_id,
+    value.clientId,
+    value.crew_member_id,
+    value.crewMemberId,
+    value.email,
+  ]
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+
+  return ids;
+};
+
 const getRoomParticipantIds = (room) => {
   const plainRoom = getPlainRoom(room) || {};
   const participantIds = new Set();
@@ -29,8 +54,7 @@ const getRoomParticipantIds = (room) => {
     ...(Array.isArray(plainRoom.manager_ids) ? plainRoom.manager_ids : []),
     ...(Array.isArray(plainRoom.production_ids) ? plainRoom.production_ids : []),
   ].forEach((participant) => {
-    const id = normalizeParticipantId(participant);
-    if (id) participantIds.add(id);
+    getParticipantNotificationIds(participant).forEach((id) => participantIds.add(id));
   });
 
   return [...participantIds];
