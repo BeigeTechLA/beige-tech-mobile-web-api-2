@@ -104,11 +104,38 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
       payload.notification_preferences = notificationPreferences;
     }
 
-    const tokensRecord = await FcmToken.findOneAndUpdate(
-      sessionId ? { user_id: normalizedUserId, session_id: sessionId } : { fcm_token: fcmToken },
-      { $set: payload },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
-    );
+    let tokensRecord = await FcmToken.findOne({ fcm_token: fcmToken });
+
+    if (tokensRecord) {
+      tokensRecord = await FcmToken.findByIdAndUpdate(
+        tokensRecord._id,
+        { $set: payload },
+        { new: true, setDefaultsOnInsert: true }
+      );
+    } else {
+      tokensRecord = await FcmToken.findOneAndUpdate(
+        sessionId ? { user_id: normalizedUserId, session_id: sessionId } : { fcm_token: fcmToken },
+        { $set: payload },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+    }
+
+    if (sessionId && tokensRecord?._id) {
+      await FcmToken.updateMany(
+        {
+          user_id: normalizedUserId,
+          session_id: sessionId,
+          _id: { $ne: tokensRecord._id },
+          is_active: true,
+        },
+        {
+          $set: {
+            is_active: false,
+            last_used_at: new Date(),
+          },
+        }
+      );
+    }
 
     logger.info(`FCM token saved for user ${normalizedUserId}`);
     return tokensRecord;
