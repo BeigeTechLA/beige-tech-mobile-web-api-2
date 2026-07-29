@@ -568,7 +568,6 @@ const ensureParentFolderMetadata = async (cleanPath) => {
               repairedFromUpload: true,
             },
             createdAt: touchedAt,
-            updatedAt: touchedAt,
           },
         },
         {
