@@ -34,7 +34,10 @@ router
   .delete(validate(userValidation.deleteUser), userController.deleteUser);
 
 //User's FCM token update API route
-router.route("/:userId/fcm").patch(userController.updateFCMToken);
+router
+  .route("/:userId/fcm")
+  .patch(userController.updateFCMToken)
+  .delete(userController.removeFCMToken);
 
 module.exports = router;
 
