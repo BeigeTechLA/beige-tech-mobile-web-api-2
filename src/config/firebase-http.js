@@ -66,7 +66,16 @@ const getFirebaseProjectForToken = ({ appUserType, deviceType }) => {
   const currentEnv = normalizeString(process.env.NODE_ENV)?.toLowerCase();
   const normalizedAppUserType = normalizeString(appUserType);
   const normalizedDeviceType = normalizeString(deviceType)?.toLowerCase();
+  console.log('NODE_ENV:', process.env.NODE_ENV);
 
+  console.log('firebaseProjects:', JSON.stringify(firebaseProjects, null, 2));
+
+  console.log('Searching with:', {
+      appUserType,
+      deviceType,
+      normalizedAppUserType,
+      normalizedDeviceType
+  });
   const project = firebaseProjects.find((item) => (
     (!item.env || item.env === currentEnv) &&
     (!item.appUserType || item.appUserType === normalizedAppUserType) &&
@@ -78,7 +87,19 @@ const getFirebaseProjectForToken = ({ appUserType, deviceType }) => {
     error.code = 'FIREBASE_PROJECT_TOKEN_MAPPING_MISSING';
     throw error;
   }
-
+  firebaseProjects.forEach((item) => {
+      console.log({
+          key: item.key,
+          env: item.env,
+          appUserType: item.appUserType,
+          deviceTypes: item.deviceTypes,
+          envMatch: (!item.env || item.env === currentEnv),
+          appUserTypeMatch:
+              (!item.appUserType || item.appUserType === normalizedAppUserType),
+          deviceTypeMatch:
+              (!item.deviceTypes.length || item.deviceTypes.includes(normalizedDeviceType))
+      });
+  });
   return validateFirebaseProject(project);
 };
 
