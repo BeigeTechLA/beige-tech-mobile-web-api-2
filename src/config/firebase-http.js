@@ -50,6 +50,16 @@ const parseFirebaseProjects = () => {
 
 const firebaseProjects = parseFirebaseProjects();
 
+console.log('Firebase project mappings loaded:', firebaseProjects.map((project) => ({
+  key: project.key,
+  env: project.env,
+  appUserType: project.appUserType,
+  deviceTypes: project.deviceTypes,
+  hasProjectId: !!project.projectId,
+  hasClientEmail: !!project.clientEmail,
+  hasPrivateKey: !!project.privateKey,
+})));
+
 const validateFirebaseProject = (project) => {
   if (!project.projectId || !project.clientEmail || !project.privateKey) {
     const error = new Error(`Firebase HTTP v1 config is incomplete for project key: ${project.key}`);
@@ -74,6 +84,21 @@ const getFirebaseProjectForToken = ({ appUserType, deviceType }) => {
   ));
 
   if (!project) {
+    console.warn('Firebase project mapping not found:', {
+      currentEnv,
+      appUserType: normalizedAppUserType,
+      deviceType: normalizedDeviceType,
+      availableMappings: firebaseProjects.map((item) => ({
+        key: item.key,
+        env: item.env,
+        appUserType: item.appUserType,
+        deviceTypes: item.deviceTypes,
+        hasProjectId: !!item.projectId,
+        hasClientEmail: !!item.clientEmail,
+        hasPrivateKey: !!item.privateKey,
+      })),
+    });
+
     const error = new Error('Firebase project config not found for token app_user_type/device_type.');
     error.code = 'FIREBASE_PROJECT_TOKEN_MAPPING_MISSING';
     throw error;
