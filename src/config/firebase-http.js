@@ -104,6 +104,13 @@ const getFirebaseProjectForToken = ({ appUserType, deviceType }) => {
     throw error;
   }
 
+  console.log('Firebase project mapping selected:', {
+    key: project.key,
+    currentEnv,
+    appUserType: normalizedAppUserType,
+    deviceType: normalizedDeviceType,
+  });
+
   return validateFirebaseProject(project);
 };
 
