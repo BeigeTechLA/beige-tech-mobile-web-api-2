@@ -1,6 +1,7 @@
 const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
 const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const DEFAULT_PROJECT_KEY = process.env.FIREBASE_PROJECT_KEY || 'default';
+const DEFAULT_FIREBASE_PROJECT_ENV = process.env.FIREBASE_PROJECT_ENV || process.env.NODE_ENV;
 
 const normalizePrivateKey = (value) => value?.replace(/\\n/g, '\n');
 const normalizeString = (value) => {
@@ -11,7 +12,7 @@ const normalizeString = (value) => {
 
 const normalizeProject = (project = {}) => ({
   key: normalizeString(project.key || project.project_key) || DEFAULT_PROJECT_KEY,
-  env: normalizeString(project.env || project.environment || process.env.NODE_ENV)?.toLowerCase(),
+  env: normalizeString(project.env || project.environment || DEFAULT_FIREBASE_PROJECT_ENV)?.toLowerCase(),
   appUserType: normalizeString(project.app_user_type || project.appUserType),
   deviceTypes: Array.isArray(project.device_types || project.deviceTypes)
     ? (project.device_types || project.deviceTypes).map((item) => normalizeString(item)?.toLowerCase()).filter(Boolean)
@@ -36,7 +37,7 @@ const parseFirebaseProjects = () => {
   return [
     normalizeProject({
       key: DEFAULT_PROJECT_KEY,
-      env: process.env.NODE_ENV,
+      env: DEFAULT_FIREBASE_PROJECT_ENV,
       app_user_type: process.env.FIREBASE_APP_USER_TYPE,
       device_types: process.env.FIREBASE_DEVICE_TYPES
         ? process.env.FIREBASE_DEVICE_TYPES.split(',')
@@ -73,7 +74,7 @@ const validateFirebaseProject = (project) => {
 const getFirebaseProjects = () => firebaseProjects.map(validateFirebaseProject);
 
 const getFirebaseProjectForToken = ({ appUserType, deviceType }) => {
-  const currentEnv = normalizeString(process.env.NODE_ENV)?.toLowerCase();
+  const currentEnv = normalizeString(DEFAULT_FIREBASE_PROJECT_ENV)?.toLowerCase();
   const normalizedAppUserType = normalizeString(appUserType);
   const normalizedDeviceType = normalizeString(deviceType)?.toLowerCase();
 

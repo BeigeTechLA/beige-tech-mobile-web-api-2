@@ -59,6 +59,9 @@ const envVarsSchema = Joi.object()
     FIREBASE_PROJECT_KEY: Joi.string().description(
       "Firebase project config key for FCM HTTP v1"
     ),
+    FIREBASE_PROJECT_ENV: Joi.string().description(
+      "Firebase project mapping environment for FCM HTTP v1"
+    ),
     FIREBASE_PROJECTS_JSON: Joi.string().description(
       "JSON Firebase project mappings for FCM HTTP v1"
     ),
