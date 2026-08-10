@@ -41,6 +41,11 @@ const NOTIFICATION_TOPICS = new Set([
   'system',
 ]);
 
+const DEFAULT_NOTIFICATION_PREFERENCES = {
+  push_enabled: true,
+  topics: Object.fromEntries(Array.from(NOTIFICATION_TOPICS).map((topic) => [topic, true])),
+};
+
 const normalizeTopic = (value) => {
   const topic = normalizeString(value)?.toLowerCase();
   return NOTIFICATION_TOPICS.has(topic) ? topic : 'system';
@@ -212,6 +217,39 @@ const updateNotificationPreferences = async (userId, options = {}) => {
     return updatedToken;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
+    throw error;
+  }
+};
+
+const getNotificationPreferences = async (userId, options = {}) => {
+  try {
+    const normalizedUserId = normalizeString(userId);
+    const sessionId = normalizeString(options.session_id);
+
+    if (!normalizedUserId || !sessionId) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "userId and session_id are required");
+    }
+
+    const tokenRecord = await FcmToken.findOne({
+      user_id: normalizedUserId,
+      session_id: sessionId,
+      is_active: true,
+    }).select('notification_preferences');
+
+    return {
+      ...DEFAULT_NOTIFICATION_PREFERENCES,
+      ...(tokenRecord?.notification_preferences?.toObject
+        ? tokenRecord.notification_preferences.toObject()
+        : tokenRecord?.notification_preferences || {}),
+      topics: {
+        ...DEFAULT_NOTIFICATION_PREFERENCES.topics,
+        ...(tokenRecord?.notification_preferences?.topics?.toObject
+          ? tokenRecord.notification_preferences.topics.toObject()
+          : tokenRecord?.notification_preferences?.topics || {}),
+      },
+    };
+  } catch (error) {
+    logger.error("Error fetching FCM notification preferences:", error);
     throw error;
   }
 };
@@ -402,5 +440,6 @@ module.exports = {
   saveFCMToken,
   removeFCMToken,
   updateNotificationPreferences,
+  getNotificationPreferences,
   sendNotification,
 };

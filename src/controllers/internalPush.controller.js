@@ -30,6 +30,16 @@ const updatePreferences = catchAsync(async (req, res) => {
   res.status(httpStatus.OK).send(token);
 });
 
+const getPreferences = catchAsync(async (req, res) => {
+  const preferences = await fcmService.getNotificationPreferences(req.query.user_id, {
+    session_id: req.query.session_id,
+  });
+
+  res.status(httpStatus.OK).send({
+    notification_preferences: preferences,
+  });
+});
+
 const sendNotification = catchAsync(async (req, res) => {
   const result = await fcmService.sendNotification(
     req.body.user_id,
@@ -45,5 +55,6 @@ module.exports = {
   saveToken,
   removeToken,
   updatePreferences,
+  getPreferences,
   sendNotification,
 };
