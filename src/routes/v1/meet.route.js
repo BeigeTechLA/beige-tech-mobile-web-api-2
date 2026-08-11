@@ -8,4 +8,6 @@ router
   .post(meetTokenController.createMeetToken)
   .get(meetTokenController.oauth2callback);
 
+router.post("/update-event", meetTokenController.updateMeetEvent);
+
 module.exports = router;

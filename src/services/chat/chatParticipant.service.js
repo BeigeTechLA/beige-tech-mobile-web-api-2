@@ -163,7 +163,7 @@ const sendAddedParticipantsTemplateEmail = async ({
  * Add participants to a chat room (Admin only)
  */
 const addParticipants = async (chatRoomId, participantData, adminId, adminName) => {
-  const { role, user_ids, participants } = participantData;
+  const { role, user_ids, participants, silent = false } = participantData;
 
   try {
     const chatRoom = await ChatRoom.findById(chatRoomId);
@@ -230,7 +230,10 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
           }
           break;
         case 'cp':
-          const existingCp = chatRoom.cp_ids.find(cp => String(cp.id) === String(user.id));
+          const existingCp = chatRoom.cp_ids.find((cp) =>
+            String(cp.id) === String(user.id) ||
+            (normalizeEmail(cp.email) && normalizeEmail(cp.email) === normalizeEmail(user.email))
+          );
           if (!existingCp) {
             participantEntry.decision = 'pending';
             chatRoom.cp_ids.push(participantEntry);
@@ -260,7 +263,10 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
           }
           break;
         case 'production':
-          const existingProd = chatRoom.production_ids?.find(p => String(p.id) === String(user.id));
+          const existingProd = chatRoom.production_ids?.find((p) =>
+            String(p.id) === String(user.id) ||
+            (normalizeEmail(p.email) && normalizeEmail(p.email) === normalizeEmail(user.email))
+          );
           if (!existingProd) {
             participantEntry.role = 'production';
             chatRoom.production_ids = chatRoom.production_ids || [];
@@ -279,7 +285,10 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
         case 'manager':
         case 'admin':
         case 'sales_rep':
-          const existingManager = chatRoom.manager_ids?.find(m => String(m.id) === String(user.id));
+          const existingManager = chatRoom.manager_ids?.find((m) =>
+            String(m.id) === String(user.id) ||
+            (normalizeEmail(m.email) && normalizeEmail(m.email) === normalizeEmail(user.email))
+          );
           if (!existingManager) {
             chatRoom.manager_ids = chatRoom.manager_ids || [];
             chatRoom.manager_ids.push(participantEntry);
@@ -347,29 +356,32 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
                       role === 'sales_rep' ? 'Sales Rep' :
                       role === 'admin' ? 'Admin' : 'Admin/Manager';
 
-    const systemMessage = await ChatMessage.create({
-      chat_room_id: chatRoomId,
-      message: `${adminName} added ${addedUserNames.join(', ')} as ${roleLabel}`,
-      message_type: 'system',
-      system_message: {
-        type: 'participant_added',
-        actor_id: adminId,
-        actor_name: adminName,
-        target_ids: addedUserIds,
-        target_names: addedUserNames,
-        target_role: role,
-      },
-    });
+    let systemMessage = null;
+    if (!silent) {
+      systemMessage = await ChatMessage.create({
+        chat_room_id: chatRoomId,
+        message: `${adminName} added ${addedUserNames.join(', ')} as ${roleLabel}`,
+        message_type: 'system',
+        system_message: {
+          type: 'participant_added',
+          actor_id: adminId,
+          actor_name: adminName,
+          target_ids: addedUserIds,
+          target_names: addedUserNames,
+          target_role: role,
+        },
+      });
 
-    // Update last message
-    await ChatRoom.findByIdAndUpdate(chatRoomId, { last_message: systemMessage._id });
+      // Update last message
+      await ChatRoom.findByIdAndUpdate(chatRoomId, { last_message: systemMessage._id });
 
-    await sendAddedParticipantsTemplateEmail({
-      chatRoom,
-      addedParticipantIds: addedUserIds,
-      addedParticipantEmails,
-      adminName,
-    });
+      await sendAddedParticipantsTemplateEmail({
+        chatRoom,
+        addedParticipantIds: addedUserIds,
+        addedParticipantEmails,
+        adminName,
+      });
+    }
 
     return { chatRoom, systemMessage };
   } catch (error) {

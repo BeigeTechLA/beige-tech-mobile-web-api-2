@@ -16,6 +16,7 @@ router.patch("/:meetingId", auth(), externalMeetingsController.updateMeeting);
 router.delete("/:meetingId", auth(), externalMeetingsController.deleteMeeting);
 
 router.post("/create-event", auth(), externalMeetingsController.createMeetEvent);
+router.post("/update-event", auth(), externalMeetingsController.updateMeetEvent);
 router.post("/schedule/:meetingId", auth(), externalMeetingsController.placeChangeRequest);
 router.patch(
   "/schedule/:meetingId/:status",

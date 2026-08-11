@@ -56,6 +56,33 @@ const envVarsSchema = Joi.object()
     FIREBASE_SERVICE_ACCOUNT: Joi.string().description(
       "Firebase service account secret"
     ),
+    FIREBASE_PROJECT_KEY: Joi.string().description(
+      "Firebase project config key for FCM HTTP v1"
+    ),
+    FIREBASE_PROJECT_ENV: Joi.string().description(
+      "Firebase project mapping environment for FCM HTTP v1"
+    ),
+    FIREBASE_PROJECTS_JSON: Joi.string().description(
+      "JSON Firebase project mappings for FCM HTTP v1"
+    ),
+    FIREBASE_APP_USER_TYPE: Joi.string().description(
+      "Fallback app user type for single Firebase project config"
+    ),
+    FIREBASE_DEVICE_TYPES: Joi.string().description(
+      "Fallback comma-separated device types for single Firebase project config"
+    ),
+    FIREBASE_PROJECT_ID: Joi.string().description(
+      "Firebase project id for FCM HTTP v1"
+    ),
+    FIREBASE_CLIENT_EMAIL: Joi.string().description(
+      "Firebase service account client email for FCM HTTP v1"
+    ),
+    FIREBASE_PRIVATE_KEY: Joi.string().description(
+      "Firebase service account private key for FCM HTTP v1"
+    ),
+    PUSH_NOTIFICATION_INTERNAL_API_KEY: Joi.string().description(
+      "Shared secret for internal push notification APIs"
+    ),
     GOOGLE_PLACES_API_KEY: Joi.string().description(
       "Google Places API key for fetching reviews"
     ),
