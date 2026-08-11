@@ -309,7 +309,11 @@ const getChatRoomByOrderId = async (orderId) => {
  */
 const getChatRoomByUserId = async (userId) => {
   try {
-    return ChatRoom.find().or([{ cp_id: userId }, { client_id: userId }]);
+    return ChatRoom.find().or([
+      { cp_id: userId },
+      { client_id: userId },
+      { "client_ids.id": userId },
+    ]);
   } catch (error) {
     throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, error.message);
   }
@@ -351,6 +355,7 @@ const createChatRoom = async (reqBody, adminRef = null) => {
     const chatRoomData = {
       chat_id: chatId,
       name: chatName,
+      client_ids: [],
       cp_ids: [],
       manager_ids: [],
     };
@@ -387,12 +392,22 @@ const createChatRoom = async (reqBody, adminRef = null) => {
 
         switch (participant.role) {
           case 'client':
-            if (mongoose.Types.ObjectId.isValid(String(resolvedUser.id))) {
-              chatRoomData.client_id = resolvedUser.id;
-              chatRoomData.client_snapshot = undefined;
+            participantEntry.role = 'client';
+            if (!chatRoomData.client_id && !chatRoomData.client_snapshot) {
+              if (mongoose.Types.ObjectId.isValid(String(resolvedUser.id))) {
+                chatRoomData.client_id = resolvedUser.id;
+                chatRoomData.client_snapshot = undefined;
+              } else {
+                chatRoomData.client_snapshot = participantEntry;
+              }
             } else {
-              participantEntry.role = 'client';
-              chatRoomData.client_snapshot = participantEntry;
+              const primaryClientId = String(chatRoomData.client_id || chatRoomData.client_snapshot?.id || "");
+              const existingExtraClient = chatRoomData.client_ids.find(
+                (client) => String(client.id || "") === String(resolvedUser.id)
+              );
+              if (primaryClientId !== String(resolvedUser.id) && !existingExtraClient) {
+                chatRoomData.client_ids.push(participantEntry);
+              }
             }
             break;
           case 'cp':
@@ -426,6 +441,7 @@ const createChatRoom = async (reqBody, adminRef = null) => {
 
     const hasMappedParticipants =
       (chatRoomData.manager_ids && chatRoomData.manager_ids.length > 0) ||
+      (chatRoomData.client_ids && chatRoomData.client_ids.length > 0) ||
       (chatRoomData.cp_ids && chatRoomData.cp_ids.length > 0) ||
       (chatRoomData.production_ids && chatRoomData.production_ids.length > 0) ||
       !!chatRoomData.pm_id ||
@@ -445,6 +461,13 @@ const createChatRoom = async (reqBody, adminRef = null) => {
     // Collect all participant IDs for key distribution
     const allParticipantIds = [];
     if (chatRoomData.client_id) allParticipantIds.push(chatRoomData.client_id.toString());
+    if (chatRoomData.client_ids) {
+      chatRoomData.client_ids.forEach(client => {
+        if (client.id && mongoose.Types.ObjectId.isValid(String(client.id))) {
+          allParticipantIds.push(client.id.toString());
+        }
+      });
+    }
     if (adminUser?.id && mongoose.Types.ObjectId.isValid(String(adminUser.id))) {
       allParticipantIds.push(String(adminUser.id));
     }

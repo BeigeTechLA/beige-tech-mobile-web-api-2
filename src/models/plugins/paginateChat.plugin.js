@@ -24,20 +24,29 @@ const paginateChat = (schema) => {
 
     let searchQuery = {};
     if (filter.search) {
+      const searchRoomIds = filter.search_room_ids || [];
       searchQuery = {
         $or: [
           { name: { $regex: filter.search, $options: "i" } },
           { chat_id: { $regex: filter.search, $options: "i" } },
+          { external_order_ref: { $regex: filter.search, $options: "i" } },
+          { "client_snapshot.name": { $regex: filter.search, $options: "i" } },
+          { "client_snapshot.email": { $regex: filter.search, $options: "i" } },
+          { "client_ids.name": { $regex: filter.search, $options: "i" } },
+          { "client_ids.email": { $regex: filter.search, $options: "i" } },
+          ...(searchRoomIds.length ? [{ _id: { $in: searchRoomIds } }] : []),
         ],
       };
       delete filter.search;
+      delete filter.search_room_ids;
     }
 
-    const countPromise = this.countDocuments({
-      ...filter,
-      ...searchQuery,
-    }).exec();
-    let docsPromise = this.find({ ...filter, ...searchQuery })
+    const query = Object.keys(searchQuery).length && filter.$or
+      ? { $and: [filter, searchQuery] }
+      : { ...filter, ...searchQuery };
+
+    const countPromise = this.countDocuments(query).exec();
+    let docsPromise = this.find(query)
       .sort(sort)
       .skip(skip)
       .limit(limit);
@@ -57,33 +66,6 @@ const paginateChat = (schema) => {
 
     return Promise.all([countPromise, docsPromise]).then(async (values) => {
       const [totalResults, results] = values;
-
-      // Filter results based on order_name or chat name if search is provided
-      if (options.search) {
-        const searchLower = options.search.toLowerCase();
-        const filteredResults = results.filter(
-          (doc) =>
-            // Search by new chat name field
-            (doc.name && doc.name.toLowerCase().includes(searchLower)) ||
-            // Search by chat_id
-            (doc.chat_id && doc.chat_id.includes(options.search)) ||
-            // Fallback to order_name search
-            (doc.order_id &&
-              doc.order_id.order_name &&
-              doc.order_id.order_name.toLowerCase().includes(searchLower))
-        );
-
-        const totalFilteredResults = filteredResults.length;
-        const totalFilteredPages = Math.ceil(totalFilteredResults / limit);
-
-        return {
-          results: filteredResults,
-          page,
-          limit,
-          totalPages: totalFilteredPages,
-          totalResults: totalFilteredResults,
-        };
-      }
 
       const totalPages = Math.ceil(totalResults / limit);
       return {
