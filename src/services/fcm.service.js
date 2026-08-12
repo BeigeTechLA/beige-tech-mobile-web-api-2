@@ -4,7 +4,7 @@
  */
 
 const logger = require("../config/logger");
-const { FcmToken } = require("../models");
+const { FcmToken, FcmPreference } = require("../models");
 const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
 const { getFirebaseProjectForToken } = require("../config/firebase-http");
 const ApiError = require("../utils/ApiError");
@@ -74,8 +74,77 @@ const normalizeNotificationPreferences = (preferences = {}) => {
   return normalized;
 };
 
-const isPushAllowedForToken = (tokenRecord, topic) => {
-  const preferences = tokenRecord.notification_preferences || {};
+const mergeWithDefaultPreferences = (preferences = {}) => {
+  const plainPreferences = preferences?.toObject ? preferences.toObject() : preferences || {};
+  const plainTopics = plainPreferences.topics?.toObject
+    ? plainPreferences.topics.toObject()
+    : plainPreferences.topics || {};
+
+  return {
+    ...DEFAULT_NOTIFICATION_PREFERENCES,
+    push_enabled: typeof plainPreferences.push_enabled === 'boolean'
+      ? plainPreferences.push_enabled
+      : DEFAULT_NOTIFICATION_PREFERENCES.push_enabled,
+    topics: {
+      ...DEFAULT_NOTIFICATION_PREFERENCES.topics,
+      ...plainTopics,
+    },
+  };
+};
+
+const saveSessionPreferences = async ({
+  userId,
+  sessionId,
+  notificationPreferences,
+}) => {
+  const normalizedUserId = normalizeString(userId);
+  const normalizedSessionId = normalizeString(sessionId);
+
+  if (!normalizedUserId || !normalizedSessionId) return null;
+  if (!notificationPreferences || !Object.keys(notificationPreferences).length) return null;
+
+  return FcmPreference.findOneAndUpdate(
+    {
+      user_id: normalizedUserId,
+      session_id: normalizedSessionId,
+    },
+    {
+      $set: {
+        notification_preferences: notificationPreferences,
+        is_active: true,
+        last_used_at: new Date(),
+      },
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+};
+
+const getSessionPreferences = async ({ userId, sessionId }) => {
+  const normalizedUserId = normalizeString(userId);
+  const normalizedSessionId = normalizeString(sessionId);
+
+  if (!normalizedUserId || !normalizedSessionId) return DEFAULT_NOTIFICATION_PREFERENCES;
+
+  const preferenceRecord = await FcmPreference.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  if (preferenceRecord) {
+    return mergeWithDefaultPreferences(preferenceRecord.notification_preferences);
+  }
+
+  const tokenRecord = await FcmToken.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  return mergeWithDefaultPreferences(tokenRecord?.notification_preferences);
+};
+
+const isPushAllowedForPreferences = (preferences, topic) => {
   if (preferences.push_enabled === false) return false;
 
   const topics = preferences.topics || {};
@@ -126,6 +195,14 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     if (sessionId && tokensRecord?._id) {
+      if (Object.keys(notificationPreferences).length) {
+        await saveSessionPreferences({
+          userId: normalizedUserId,
+          sessionId,
+          notificationPreferences,
+        });
+      }
+
       await FcmToken.updateMany(
         {
           user_id: normalizedUserId,
@@ -194,7 +271,13 @@ const updateNotificationPreferences = async (userId, options = {}) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "notification_preferences is required");
     }
 
-    const updatedToken = await FcmToken.findOneAndUpdate(
+    const updatedPreference = await saveSessionPreferences({
+      userId: normalizedUserId,
+      sessionId,
+      notificationPreferences,
+    });
+
+    await FcmToken.updateMany(
       {
         user_id: normalizedUserId,
         session_id: sessionId,
@@ -205,16 +288,11 @@ const updateNotificationPreferences = async (userId, options = {}) => {
           notification_preferences: notificationPreferences,
           last_used_at: new Date(),
         },
-      },
-      { new: true }
+      }
     );
 
-    if (!updatedToken) {
-      throw new ApiError(httpStatus.NOT_FOUND, "Active FCM session not found");
-    }
-
     logger.info(`FCM notification preferences updated for user ${normalizedUserId}`);
-    return updatedToken;
+    return updatedPreference;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
     throw error;
@@ -230,24 +308,10 @@ const getNotificationPreferences = async (userId, options = {}) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and session_id are required");
     }
 
-    const tokenRecord = await FcmToken.findOne({
-      user_id: normalizedUserId,
-      session_id: sessionId,
-      is_active: true,
-    }).select('notification_preferences');
-
-    return {
-      ...DEFAULT_NOTIFICATION_PREFERENCES,
-      ...(tokenRecord?.notification_preferences?.toObject
-        ? tokenRecord.notification_preferences.toObject()
-        : tokenRecord?.notification_preferences || {}),
-      topics: {
-        ...DEFAULT_NOTIFICATION_PREFERENCES.topics,
-        ...(tokenRecord?.notification_preferences?.topics?.toObject
-          ? tokenRecord.notification_preferences.topics.toObject()
-          : tokenRecord?.notification_preferences?.topics || {}),
-      },
-    };
+    return getSessionPreferences({
+      userId: normalizedUserId,
+      sessionId,
+    });
   } catch (error) {
     logger.error("Error fetching FCM notification preferences:", error);
     throw error;
@@ -317,12 +381,21 @@ const sendNotification = async (userId, title, content, customData) => {
       const normalizedUserId = normalizeString(userId);
       const recipientTokenRecords = await getTokenRecordsByUserId(userId);
       const topic = normalizeTopic(customData?.topic || customData?.category || customData?.type);
-      const allowedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
-        isPushAllowedForToken(tokenRecord, topic)
-      ));
-      const blockedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
-        !isPushAllowedForToken(tokenRecord, topic)
-      ));
+      const tokenRecordsWithPreferences = await Promise.all(
+        recipientTokenRecords.map(async (tokenRecord) => ({
+          tokenRecord,
+          preferences: await getSessionPreferences({
+            userId: tokenRecord.user_id,
+            sessionId: tokenRecord.session_id,
+          }),
+        }))
+      );
+      const allowedTokenRecords = tokenRecordsWithPreferences
+        .filter(({ preferences }) => isPushAllowedForPreferences(preferences, topic))
+        .map(({ tokenRecord }) => tokenRecord);
+      const blockedTokenRecords = tokenRecordsWithPreferences
+        .filter(({ preferences }) => !isPushAllowedForPreferences(preferences, topic))
+        .map(({ tokenRecord }) => tokenRecord);
 
       if (!allowedTokenRecords.length) {
         resolve({
