@@ -368,7 +368,9 @@ const deleteMessageHandler = async (req, res) => {
       });
     }
 
-    const updated = await chatService.softDeleteMessage(req.params.messageId, String(deleterId));
+    const updated = await chatService.softDeleteMessage(req.params.messageId, String(deleterId), {
+      allowAnySender: Boolean(req.body.allowAnySender),
+    });
     const roomId = String(
       updated?.chat_room_id || updated?.chatRoomId || req.body.roomId || req.body.chat_room_id || ""
     );

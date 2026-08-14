@@ -243,6 +243,11 @@ const syncRoomEncryptionKeys = async (chatRoomId) => {
     // Collect all participant IDs
     const allParticipantIds = new Set();
     if (chatRoom.client_id) allParticipantIds.add(chatRoom.client_id.toString());
+    if (chatRoom.client_ids) {
+      chatRoom.client_ids.forEach(client => {
+        if (client.id) allParticipantIds.add(client.id.toString());
+      });
+    }
     if (chatRoom.pm_id) allParticipantIds.add(chatRoom.pm_id.toString());
     if (chatRoom.cp_ids) {
       chatRoom.cp_ids.forEach(cp => {

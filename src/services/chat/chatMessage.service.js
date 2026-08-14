@@ -28,6 +28,9 @@ const collectAllChatParticipantRefs = (chatRoom = {}) => {
   const refs = [];
 
   if (chatRoom.client_id) refs.push({ id: chatRoom.client_id, role: "client" });
+  (chatRoom.client_ids || []).forEach((client) =>
+    refs.push({ id: client?.id, email: client?.email, name: client?.name, role: "client" })
+  );
   if (chatRoom.pm_id) refs.push({ id: chatRoom.pm_id, role: "pm" });
   (chatRoom.cp_ids || []).forEach((cp) => refs.push({ id: cp?.id, email: cp?.email, name: cp?.name, role: "cp" }));
   (chatRoom.manager_ids || []).forEach((m) =>
@@ -160,8 +163,19 @@ const hydrateMessageSender = async (message) => {
 const getChatsByRoomId = async (options, chatRoomId, userId = null) => {
   const filter = {};
   filter.chat_room_id = chatRoomId;
+  const search = String(options.search || "").trim();
+  delete options.search;
   options.sortBy = "createdAt:desc";
   options.populate = "reply_to";
+
+  if (search) {
+    filter.$or = [
+      { message: { $regex: search, $options: "i" } },
+      { sent_by_name: { $regex: search, $options: "i" } },
+      { sent_by_email: { $regex: search, $options: "i" } },
+      { file_name: { $regex: search, $options: "i" } },
+    ];
+  }
 
   try {
     if (userId) {
@@ -339,9 +353,18 @@ const editMessage = async (messageId, newContent, editedBy, encryptedContent = n
 };
 
 /**
- * Soft delete a message (Admin only)
+ * Soft delete a message. Owners can delete their own messages; trusted admin
+ * moderation calls can delete any non-system message.
  */
-const softDeleteMessage = async (messageId, deletedBy) => {
+const normalizeActorId = (value) => {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    return String(value._id || value.id || "").trim();
+  }
+  return String(value).trim();
+};
+
+const softDeleteMessage = async (messageId, deletedBy, options = {}) => {
   try {
     const message = await ChatMessage.findById(messageId);
     if (!message) {
@@ -356,9 +379,17 @@ const softDeleteMessage = async (messageId, deletedBy) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "Cannot delete system messages");
     }
 
+    const deletedById = normalizeActorId(deletedBy);
+    const senderId = normalizeActorId(message.sent_by);
+    const allowAnySender = Boolean(options.allowAnySender);
+
+    if (!allowAnySender && (!deletedById || !senderId || senderId !== deletedById)) {
+      throw new ApiError(httpStatus.FORBIDDEN, "You can only delete your own messages");
+    }
+
     message.is_deleted = true;
     message.deleted_at = new Date();
-    message.deleted_by = deletedBy;
+    message.deleted_by = deletedById || deletedBy;
 
     await message.save();
     return message;

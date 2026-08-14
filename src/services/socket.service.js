@@ -898,13 +898,21 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
     }
 
     logger.info(`notifyAllParticipants: Processing room ${roomId}, sender: ${senderId}`);
-    logger.info(`ChatRoom participants: client_id=${chatRoom.client_id}, pm_id=${chatRoom.pm_id}, cp_ids=${JSON.stringify(chatRoom.cp_ids)}, manager_ids=${JSON.stringify(chatRoom.manager_ids)}, production_ids=${JSON.stringify(chatRoom.production_ids)}`);
+    logger.info(`ChatRoom participants: client_id=${chatRoom.client_id}, client_ids=${JSON.stringify(chatRoom.client_ids)}, pm_id=${chatRoom.pm_id}, cp_ids=${JSON.stringify(chatRoom.cp_ids)}, manager_ids=${JSON.stringify(chatRoom.manager_ids)}, production_ids=${JSON.stringify(chatRoom.production_ids)}`);
 
     const participantIds = [];
 
     // Collect all participant IDs
     if (chatRoom.client_id && chatRoom.client_id.toString() !== senderId) {
       participantIds.push(chatRoom.client_id.toString());
+    }
+    if (chatRoom.client_ids) {
+      chatRoom.client_ids.forEach(client => {
+        const clientId = client.id?.toString();
+        if (clientId && clientId !== senderId) {
+          participantIds.push(clientId);
+        }
+      });
     }
     if (chatRoom.pm_id && chatRoom.pm_id.toString() !== senderId) {
       participantIds.push(chatRoom.pm_id.toString());
@@ -952,7 +960,20 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
     const notificationContent = `${senderName}: ${messagePreview.substring(0, 50)}${messagePreview.length > 50 ? '...' : ''}`;
 
     // Separate participants by role for database notification
-    const clientId = chatRoom.client_id && chatRoom.client_id.toString() !== senderId ? chatRoom.client_id.toString() : null;
+    const clientIds = [];
+    if (chatRoom.client_id && chatRoom.client_id.toString() !== senderId) {
+      clientIds.push(chatRoom.client_id.toString());
+    }
+    if (chatRoom.client_ids) {
+      chatRoom.client_ids.forEach(client => {
+        const clientId = client.id?.toString();
+        if (clientId && clientId !== senderId) {
+          clientIds.push(clientId);
+        }
+      });
+    }
+    const uniqueClientIds = [...new Set(clientIds)];
+    const clientId = uniqueClientIds[0] || null;
     const cpIds = chatRoom.cp_ids
       ? chatRoom.cp_ids.filter(cp => cp.id.toString() !== senderId).map(cp => cp.id.toString())
       : [];
@@ -980,6 +1001,7 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
           senderName: senderName,
           roomId: roomId,
           messageId: messageId,
+          clientIds: uniqueClientIds,
         },
       };
 

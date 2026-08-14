@@ -4,6 +4,7 @@ const pick = require("../utils/pick");
 const catchAsync = require("../utils/catchAsync");
 const ApiError = require("../utils/ApiError");
 const { chatService } = require("../services");
+const { ChatMessage } = require("../models");
 
 const normalizeQueryList = (value) => {
   if (Array.isArray(value)) {
@@ -45,6 +46,7 @@ const getChatRooms = catchAsync(async (req, res) => {
     const emails = clientIds.map((id) => id.toLowerCase()).filter((id) => id.includes("@"));
     const clientFilters = [
       { "client_snapshot.id": clientIds.length === 1 ? clientIds[0] : { $in: clientIds } },
+      { "client_ids.id": clientIds.length === 1 ? clientIds[0] : { $in: clientIds } },
     ];
 
     if (objectIds.length) {
@@ -56,6 +58,9 @@ const getChatRooms = catchAsync(async (req, res) => {
     if (emails.length) {
       clientFilters.push({
         "client_snapshot.email": emails.length === 1 ? emails[0] : { $in: emails },
+      });
+      clientFilters.push({
+        "client_ids.email": emails.length === 1 ? emails[0] : { $in: emails },
       });
     }
 
@@ -73,9 +78,16 @@ const getChatRooms = catchAsync(async (req, res) => {
 
   const options = pick(requestQuery, ["sortBy", "limit", "page", "populate"]);
 
-  // Pass search as an option instead of a filter
   if (requestQuery.search) {
-    options.search = requestQuery.search;
+    filter.search = requestQuery.search;
+    filter.search_room_ids = await ChatMessage.distinct("chat_room_id", {
+      $or: [
+        { message: { $regex: requestQuery.search, $options: "i" } },
+        { sent_by_name: { $regex: requestQuery.search, $options: "i" } },
+        { sent_by_email: { $regex: requestQuery.search, $options: "i" } },
+        { file_name: { $regex: requestQuery.search, $options: "i" } },
+      ],
+    });
   }
 
   // Pass userId to include rooms where user was removed (persistent history)
@@ -102,7 +114,7 @@ const getChatRoomById = catchAsync(async (req, res) => {
  * @returns {Promise<void>} A Promise that resolves with the chats.
  */
 const getChatsByRoomId = catchAsync(async (req, res) => {
-  const options = pick(req.query, ["sortBy", "limit", "page"]);
+  const options = pick(req.query, ["sortBy", "limit", "page", "search"]);
   // Pass userId to filter messages for removed participants
   const userId = req.user ? (req.user.id || req.user._id) : null;
   const result = await chatService.getChatsByRoomId(options, req.params.id, userId);
@@ -279,7 +291,7 @@ const softDeleteMessage = catchAsync(async (req, res) => {
   const { messageId } = req.params;
   const userId = req.user.id || req.user._id;
 
-  const message = await chatService.softDeleteMessage(messageId, userId);
+  const message = await chatService.softDeleteMessage(messageId, userId, { allowAnySender: true });
   res.status(httpStatus.OK).send(message);
 });
 
