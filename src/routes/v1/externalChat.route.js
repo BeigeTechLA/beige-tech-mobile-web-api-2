@@ -176,11 +176,15 @@ router.post("/messages/:roomId", async (req, res) => {
       });
     }
 
+    const fileUrl = String(req.body.fileUrl || req.body.file_url || "").trim();
+    const fileName = String(req.body.fileName || req.body.file_name || "").trim();
+    const fileType = String(req.body.fileType || req.body.file_type || "").trim();
+    const messageType = String(req.body.messageType || req.body.message_type || "").trim().toLowerCase();
     const message = String(req.body.message || "").trim();
-    if (!message) {
+    if (!message && !fileUrl) {
       return res.status(400).send({
         success: false,
-        message: "Message is required",
+        message: "Message or file is required",
       });
     }
 
@@ -188,14 +192,20 @@ router.post("/messages/:roomId", async (req, res) => {
     const senderId = sender.id ? String(sender.id) : null;
     const senderName = sender.name || sender.email || "Beige User";
     const replyTo = req.body.replyTo ? String(req.body.replyTo) : null;
+    const resolvedMessageType = messageType || (fileUrl ? (fileType.startsWith("image/") ? "image" : "file") : "text");
     const payload = {
       chat_room_id: req.params.roomId,
       message,
       sent_by: senderId,
       sent_by_name: senderName,
       sent_by_email: sender.email || null,
-      message_type: "text",
+      message_type: resolvedMessageType,
       status: "Sent",
+      ...(fileUrl ? {
+        file_url: fileUrl,
+        file_name: fileName || message || "Shared file",
+        file_type: fileType || null,
+      } : {}),
       ...(replyTo ? { reply_to: replyTo } : {}),
     };
     const saved = replyTo ? await chatService.sendReplyMessage(payload) : await chatService.saveChatRoomMessage(payload);
@@ -211,7 +221,7 @@ router.post("/messages/:roomId", async (req, res) => {
       String(req.params.roomId),
       senderId ? String(senderId) : "",
       senderName,
-      message,
+      message || (fileUrl ? "Attachment" : ""),
       String(saved?._id || saved?.id || "")
     ).catch(() => undefined);
 
