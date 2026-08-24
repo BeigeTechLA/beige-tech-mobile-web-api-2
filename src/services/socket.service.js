@@ -1025,6 +1025,8 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
         notificationTitle,
         notificationContent,
         {
+          topic: "messages",
+          category: "messages",
           type: "newMessage",
           senderId: senderId,
           receiverId: participantId,
@@ -1072,6 +1074,8 @@ async function notifyAddedParticipants(userIds, roomId, orderName) {
         notificationTitle,
         notificationContent,
         {
+          topic: "messages",
+          category: "messages",
           type: "addedToChat",
           roomId: roomId,
           id: roomId,
@@ -1110,6 +1114,8 @@ async function notifyRemovedParticipant(userId, roomId, orderName, removedBy) {
       notificationTitle,
       notificationContent,
       {
+        topic: "messages",
+        category: "messages",
         type: "removedFromChat",
         roomId: roomId,
         id: roomId,
