@@ -174,13 +174,22 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
       last_used_at: new Date(),
     };
 
-    if (Object.keys(notificationPreferences).length) {
+    const hasNotificationPreferences = Object.keys(notificationPreferences).length > 0;
+
+    if (hasNotificationPreferences) {
       payload.notification_preferences = notificationPreferences;
     }
 
     let tokensRecord = await FcmToken.findOne({ fcm_token: fcmToken });
 
     if (tokensRecord) {
+      const tokenChangedOwner = String(tokensRecord.user_id || '') !== normalizedUserId ||
+        String(tokensRecord.session_id || '') !== String(sessionId || '');
+
+      if (tokenChangedOwner && !hasNotificationPreferences) {
+        payload.notification_preferences = DEFAULT_NOTIFICATION_PREFERENCES;
+      }
+
       tokensRecord = await FcmToken.findByIdAndUpdate(
         tokensRecord._id,
         { $set: payload },
@@ -195,7 +204,7 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     if (sessionId && tokensRecord?._id) {
-      if (Object.keys(notificationPreferences).length) {
+      if (hasNotificationPreferences) {
         await saveSessionPreferences({
           userId: normalizedUserId,
           sessionId,
