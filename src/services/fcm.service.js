@@ -406,15 +406,24 @@ const sendNotification = async (userId, title, content, customData) => {
         .filter(({ preferences }) => !isPushAllowedForPreferences(preferences, topic))
         .map(({ tokenRecord }) => tokenRecord);
 
-      logger.info("[FCM] Preference evaluation", {
+      const preferenceDebug = {
         user_id: normalizedUserId,
         topic,
         active_token_count: recipientTokenRecords.length,
         allowed_token_count: allowedTokenRecords.length,
         blocked_token_count: blockedTokenRecords.length,
-        allowed_sessions: allowedTokenRecords.map((record) => record.session_id).filter(Boolean),
-        blocked_sessions: blockedTokenRecords.map((record) => record.session_id).filter(Boolean),
-      });
+        tokens: tokenRecordsWithPreferences.map(({ tokenRecord, preferences }) => ({
+          token_id: String(tokenRecord._id || ''),
+          session_id: tokenRecord.session_id || null,
+          app_user_type: tokenRecord.app_user_type || null,
+          device_type: tokenRecord.device_type || null,
+          push_enabled: preferences.push_enabled,
+          topic_enabled: preferences.topics?.[topic],
+          allowed: isPushAllowedForPreferences(preferences, topic),
+        })),
+      };
+
+      logger.info(`[FCM] Preference evaluation ${JSON.stringify(preferenceDebug)}`);
 
       if (!allowedTokenRecords.length) {
         resolve({
@@ -436,6 +445,14 @@ const sendNotification = async (userId, title, content, customData) => {
       const sendResults = await Promise.all(
         allowedTokenRecords.map(async (tokenRecord) => {
           try {
+            logger.info(`[FCM] Sending Firebase push ${JSON.stringify({
+              user_id: normalizedUserId,
+              token_id: String(tokenRecord._id || ''),
+              session_id: tokenRecord.session_id || null,
+              topic,
+              type: customData?.type || null,
+            })}`);
+
             const firebaseProject = getFirebaseProjectForToken({
               appUserType: tokenRecord.app_user_type,
               deviceType: tokenRecord.device_type,
