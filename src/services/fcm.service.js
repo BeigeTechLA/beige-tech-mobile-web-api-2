@@ -132,6 +132,13 @@ const getSessionPreferences = async ({ userId, sessionId }) => {
   }).select('notification_preferences');
 
   if (preferenceRecord) {
+    logger.info(`[FCM] Session preferences source ${JSON.stringify({
+      user_id: normalizedUserId,
+      session_id: normalizedSessionId,
+      source: 'fcmpreferences',
+      push_enabled: preferenceRecord.notification_preferences?.push_enabled,
+      topics: preferenceRecord.notification_preferences?.topics || null,
+    })}`);
     return mergeWithDefaultPreferences(preferenceRecord.notification_preferences);
   }
 
@@ -140,6 +147,14 @@ const getSessionPreferences = async ({ userId, sessionId }) => {
     session_id: normalizedSessionId,
     is_active: true,
   }).select('notification_preferences');
+
+  logger.info(`[FCM] Session preferences source ${JSON.stringify({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    source: tokenRecord ? 'fcmtokens' : 'default',
+    push_enabled: tokenRecord?.notification_preferences?.push_enabled,
+    topics: tokenRecord?.notification_preferences?.topics || null,
+  })}`);
 
   return mergeWithDefaultPreferences(tokenRecord?.notification_preferences);
 };
@@ -300,7 +315,13 @@ const updateNotificationPreferences = async (userId, options = {}) => {
       }
     );
 
-    logger.info(`FCM notification preferences updated for user ${normalizedUserId}`);
+    logger.info(`[FCM] Notification preferences updated ${JSON.stringify({
+      user_id: normalizedUserId,
+      session_id: sessionId,
+      push_enabled: notificationPreferences.push_enabled,
+      topics: notificationPreferences.topics || null,
+      preference_id: String(updatedPreference?._id || ''),
+    })}`);
     return updatedPreference;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
