@@ -406,6 +406,16 @@ const sendNotification = async (userId, title, content, customData) => {
         .filter(({ preferences }) => !isPushAllowedForPreferences(preferences, topic))
         .map(({ tokenRecord }) => tokenRecord);
 
+      logger.info("[FCM] Preference evaluation", {
+        user_id: normalizedUserId,
+        topic,
+        active_token_count: recipientTokenRecords.length,
+        allowed_token_count: allowedTokenRecords.length,
+        blocked_token_count: blockedTokenRecords.length,
+        allowed_sessions: allowedTokenRecords.map((record) => record.session_id).filter(Boolean),
+        blocked_sessions: blockedTokenRecords.map((record) => record.session_id).filter(Boolean),
+      });
+
       if (!allowedTokenRecords.length) {
         resolve({
           success: false,
