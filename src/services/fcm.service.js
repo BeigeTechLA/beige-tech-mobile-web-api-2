@@ -131,32 +131,29 @@ const getSessionPreferences = async ({ userId, sessionId }) => {
     is_active: true,
   }).select('notification_preferences');
 
-  if (preferenceRecord) {
-    logger.info(`[FCM] Session preferences source ${JSON.stringify({
-      user_id: normalizedUserId,
-      session_id: normalizedSessionId,
-      source: 'fcmpreferences',
-      push_enabled: preferenceRecord.notification_preferences?.push_enabled,
-      topics: preferenceRecord.notification_preferences?.topics || null,
-    })}`);
-    return mergeWithDefaultPreferences(preferenceRecord.notification_preferences);
-  }
-
   const tokenRecord = await FcmToken.findOne({
     user_id: normalizedUserId,
     session_id: normalizedSessionId,
     is_active: true,
   }).select('notification_preferences');
 
+  const resolvedPreferences = mergePreferenceSources(
+    preferenceRecord?.notification_preferences,
+    tokenRecord?.notification_preferences
+  );
+
   logger.info(`[FCM] Session preferences source ${JSON.stringify({
     user_id: normalizedUserId,
     session_id: normalizedSessionId,
-    source: tokenRecord ? 'fcmtokens' : 'default',
-    push_enabled: tokenRecord?.notification_preferences?.push_enabled,
-    topics: tokenRecord?.notification_preferences?.topics || null,
+    source: preferenceRecord
+      ? (tokenRecord ? 'fcmpreferences+fcmtokens' : 'fcmpreferences')
+      : (tokenRecord ? 'fcmtokens' : 'default'),
+    fcmpreferences: preferenceRecord?.notification_preferences || null,
+    fcmtokens: tokenRecord?.notification_preferences || null,
+    resolved: resolvedPreferences,
   })}`);
 
-  return mergeWithDefaultPreferences(tokenRecord?.notification_preferences);
+  return resolvedPreferences;
 };
 
 const isPushAllowedForPreferences = (preferences, topic) => {
@@ -166,6 +163,25 @@ const isPushAllowedForPreferences = (preferences, topic) => {
   if (topics[topic] === false) return false;
 
   return true;
+};
+
+const mergePreferenceSources = (...sources) => {
+  const merged = mergeWithDefaultPreferences(null);
+
+  for (const source of sources) {
+    if (!source) continue;
+
+    const preferences = mergeWithDefaultPreferences(source);
+    if (preferences.push_enabled === false) merged.push_enabled = false;
+
+    for (const topic of NOTIFICATION_TOPICS) {
+      if (preferences.topics?.[topic] === false) {
+        merged.topics[topic] = false;
+      }
+    }
+  }
+
+  return merged;
 };
 
 const saveFCMToken = async (userId, registrationToken, options = {}) => {
