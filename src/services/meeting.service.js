@@ -9,6 +9,10 @@ const sendgridService = require("./sendgrid.service");
 const { MEETING_SCHEDULED_TEMPLATE_ID } = require("../config/sendgridTemplates");
 
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const MEETING_PUSH_TOPIC = {
+  topic: "meetings",
+  category: "meetings",
+};
 
 const asIdString = (value) => (value == null ? "" : String(value).trim());
 
@@ -1585,6 +1589,7 @@ const createMeeting = async (reqBody) => {
       const notificationTitle = "New meeting has been scheduled";
       const notificationContent = `A new meeting has been scheduled for order '${order.order_name}'`;
       const notificationData = {
+        ...MEETING_PUSH_TOPIC,
         type: "newMeeting",
         meetingId: meeting._id.toString(),
         id: meeting._id.toString(),
@@ -1860,6 +1865,7 @@ const placeChangeRequest = async (meetingId, reqBody) => {
 
     // Send FCM push notification to client
     sendNotification(order.client_id, notificationTitle, NotificationContent, {
+      ...MEETING_PUSH_TOPIC,
       type: "meetingScheduleUpdateRequest",
       meetingId: meetingId.toString(),
       id: meetingId.toString(),
@@ -1892,6 +1898,7 @@ const placeChangeRequest = async (meetingId, reqBody) => {
       if (cp.decision !== "cancelled") {
         cpIdsForNotification.push(cp.id);
         sendNotification(cp.id.toString(), notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleUpdateRequest",
           meetingId: meetingId.toString(),
           id: meetingId.toString(),
@@ -2005,6 +2012,7 @@ const sendMeetingStatusUpdateNotification = async (
       const notificationTitle = "Meeting Status Update";
       const NotificationContent = `The status of meeting for order '${order.order_name}' has transitioned from ${currentMeetingStatus} to ${meeting.meeting_status}`;
       const notificationData = {
+        ...MEETING_PUSH_TOPIC,
         type: "meetingStatusUpdate",
         meetingId: meeting._id.toString(),
         id: meeting._id.toString(),
@@ -2087,6 +2095,7 @@ const sendMeetingStatusUpdateNotification = async (
         const cpId = cp.id.toString();
         cpIdsForNotification.push(cp.id);
         sendNotification(cpId, notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleChangeRequestStatusUpdate",
           meetingId: meeting._id.toString(),
           id: meeting._id.toString(),
@@ -2117,6 +2126,7 @@ const sendMeetingStatusUpdateNotification = async (
       // Also notify client about reschedule request status
       if (order.client_id) {
         sendNotification(order.client_id, notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleChangeRequestStatusUpdate",
           meetingId: meeting._id.toString(),
           id: meeting._id.toString(),
@@ -2189,6 +2199,7 @@ const addMeetingParticipants = async (meetingId, participantData) => {
     const notificationTitle = "Added to Meeting";
     const notificationContent = `You have been added as a participant to a meeting`;
     const notificationData = {
+      ...MEETING_PUSH_TOPIC,
       type: "participantAdded",
       meetingId: meeting._id.toString(),
       id: meeting._id.toString(),
@@ -2276,6 +2287,7 @@ const removeMeetingParticipant = async (meetingId, userId, role) => {
     const notificationTitle = "Removed from Meeting";
     const notificationContent = `You have been removed as a participant from a meeting`;
     const notificationData = {
+      ...MEETING_PUSH_TOPIC,
       type: "participantRemoved",
       meetingId: meeting._id.toString(),
       id: meeting._id.toString(),
