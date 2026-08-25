@@ -7,6 +7,7 @@ const { sendNotification } = require("./fcm.service");
 const { createNotificationData, insertNotification } = require('../services/notification.service');
 const sendgridService = require("./sendgrid.service");
 const { MEETING_SCHEDULED_TEMPLATE_ID } = require("../config/sendgridTemplates");
+const logger = require("../config/logger");
 
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 const MEETING_PUSH_TOPIC = {
@@ -15,6 +16,13 @@ const MEETING_PUSH_TOPIC = {
 };
 
 const asIdString = (value) => (value == null ? "" : String(value).trim());
+
+const normalizeNotificationUserId = (value) => {
+  if (value && typeof value === "object") {
+    return asIdString(value.id || value._id || value.user_id || value.userId);
+  }
+  return asIdString(value);
+};
 
 const gatherMeetingIncludedUserIds = (meeting, order) => {
   const userIdSet = new Set();
@@ -1577,6 +1585,9 @@ const createMeeting = async (reqBody) => {
     delete reqBody.order_id;
     const sendNotification_flag = reqBody.send_notification;
     delete reqBody.send_notification;
+    const requestedCpIds = Array.isArray(reqBody.cp_ids)
+      ? reqBody.cp_ids.map(normalizeNotificationUserId).filter(Boolean)
+      : [];
     const meeting = await Meeting.create(reqBody);
     
     // Add the meeting ID to the order's meeting_date_times array
@@ -1621,20 +1632,34 @@ const createMeeting = async (reqBody) => {
         }
       });
 
-      // Send notifications to all CPs
+      // Send notifications to CPs from the request and from the linked order.
+      // External clients can pass app user ids (e.g. "825") that are used by FCM.
       const cpIdsForNotification = [];
+      const cpIdsForPush = new Set();
+
+      requestedCpIds.forEach((cpId) => cpIdsForPush.add(cpId));
       order.cp_ids.forEach((cp) => {
         if (cp.decision !== "cancelled") {
-          const cpId = cp.id.toString();
-          cpIdsForNotification.push(cp.id);
-          // Send FCM push notification to the CP
-          sendNotification(
-            cpId,
-            notificationTitle,
-            notificationContent,
-            notificationData
-          );
+          const cpId = normalizeNotificationUserId(cp);
+          if (cpId) cpIdsForPush.add(cpId);
         }
+      });
+
+      logger.info(`[Meeting] Create notification recipients ${JSON.stringify({
+        meeting_id: meeting._id.toString(),
+        order_id: order._id.toString(),
+        requested_cp_ids: requestedCpIds,
+        final_cp_ids: [...cpIdsForPush],
+      })}`);
+
+      cpIdsForPush.forEach((cpId) => {
+        cpIdsForNotification.push(cpId);
+        sendNotification(
+          cpId,
+          notificationTitle,
+          notificationContent,
+          notificationData
+        );
       });
 
       // Create in-app notification for all active CPs
