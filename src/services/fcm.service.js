@@ -46,6 +46,8 @@ const DEFAULT_NOTIFICATION_PREFERENCES = {
   topics: Object.fromEntries(Array.from(NOTIFICATION_TOPICS).map((topic) => [topic, true])),
 };
 
+logger.info("[FCM] Preference guard enabled: final Mongo re-check before Firebase send");
+
 const normalizeTopic = (value) => {
   const topic = normalizeString(value)?.toLowerCase();
   return NOTIFICATION_TOPICS.has(topic) ? topic : 'system';
@@ -163,6 +165,45 @@ const isPushAllowedForPreferences = (preferences, topic) => {
   if (topics[topic] === false) return false;
 
   return true;
+};
+
+const isTokenAllowedForTopic = async ({ tokenRecord, topic, userId }) => {
+  const normalizedUserId = normalizeString(userId || tokenRecord?.user_id);
+  const normalizedSessionId = normalizeString(tokenRecord?.session_id);
+
+  if (!normalizedUserId || !normalizedSessionId) {
+    return {
+      allowed: isPushAllowedForPreferences(DEFAULT_NOTIFICATION_PREFERENCES, topic),
+      preferences: DEFAULT_NOTIFICATION_PREFERENCES,
+      source: 'default',
+    };
+  }
+
+  const preferenceRecord = await FcmPreference.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  const freshTokenRecord = await FcmToken.findOne({
+    _id: tokenRecord._id,
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences session_id app_user_type device_type');
+
+  const preferences = mergePreferenceSources(
+    preferenceRecord?.notification_preferences,
+    freshTokenRecord?.notification_preferences
+  );
+
+  return {
+    allowed: Boolean(freshTokenRecord) && isPushAllowedForPreferences(preferences, topic),
+    preferences,
+    source: preferenceRecord
+      ? (freshTokenRecord ? 'fcmpreferences+fcmtokens' : 'fcmpreferences')
+      : (freshTokenRecord ? 'fcmtokens' : 'default'),
+  };
 };
 
 const mergePreferenceSources = (...sources) => {
@@ -482,6 +523,30 @@ const sendNotification = async (userId, title, content, customData) => {
       const sendResults = await Promise.all(
         allowedTokenRecords.map(async (tokenRecord) => {
           try {
+            const finalPreferenceCheck = await isTokenAllowedForTopic({
+              tokenRecord,
+              topic,
+              userId: normalizedUserId,
+            });
+
+            logger.info(`[FCM] Final send preference check ${JSON.stringify({
+              user_id: normalizedUserId,
+              token_id: String(tokenRecord._id || ''),
+              session_id: tokenRecord.session_id || null,
+              topic,
+              source: finalPreferenceCheck.source,
+              allowed: finalPreferenceCheck.allowed,
+              preferences: finalPreferenceCheck.preferences,
+            })}`);
+
+            if (!finalPreferenceCheck.allowed) {
+              return {
+                success: false,
+                tokenRecord,
+                blockedByPreferences: true,
+              };
+            }
+
             logger.info(`[FCM] Sending Firebase push ${JSON.stringify({
               user_id: normalizedUserId,
               token_id: String(tokenRecord._id || ''),
@@ -530,7 +595,8 @@ const sendNotification = async (userId, title, content, customData) => {
       }
 
       const successCount = sendResults.filter((result) => result.success).length;
-      const failureCount = sendResults.length - successCount;
+      const finalPreferenceBlockedCount = sendResults.filter((result) => result.blockedByPreferences).length;
+      const failureCount = sendResults.filter((result) => !result.success && !result.blockedByPreferences).length;
       logMessageDeliveryStatus({ successCount, failureCount });
 
       resolve({
@@ -541,6 +607,7 @@ const sendNotification = async (userId, title, content, customData) => {
           active_token_count: recipientTokenRecords.length,
           preference_allowed_token_count: allowedTokenRecords.length,
           preference_blocked_token_count: blockedTokenRecords.length,
+          final_preference_blocked_token_count: finalPreferenceBlockedCount,
           success_count: successCount,
           failure_count: failureCount,
           failures: sendResults
@@ -555,6 +622,7 @@ const sendNotification = async (userId, title, content, customData) => {
               error_code: result.error?.code || null,
               http_code: result.error?.httpCode || null,
               is_permanent_token_error: !!result.error?.isPermanentTokenError,
+              blocked_by_preferences: !!result.blockedByPreferences,
             })),
         },
       });
