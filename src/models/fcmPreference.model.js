@@ -23,10 +23,6 @@ const preferenceSchema = mongoose.Schema(
           type: Boolean,
           default: true,
         },
-        payments: {
-          type: Boolean,
-          default: true,
-        },
         messages: {
           type: Boolean,
           default: true,
@@ -35,15 +31,7 @@ const preferenceSchema = mongoose.Schema(
           type: Boolean,
           default: true,
         },
-        proposals: {
-          type: Boolean,
-          default: true,
-        },
         files: {
-          type: Boolean,
-          default: true,
-        },
-        system: {
           type: Boolean,
           default: true,
         },

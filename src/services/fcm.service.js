@@ -33,12 +33,9 @@ const normalizeDeviceType = (value) => {
 
 const NOTIFICATION_TOPICS = new Set([
   'shoots',
-  'payments',
   'messages',
   'meetings',
-  'proposals',
   'files',
-  'system',
 ]);
 
 const DEFAULT_NOTIFICATION_PREFERENCES = {
@@ -50,7 +47,7 @@ logger.info("[FCM] Preference guard enabled: final Mongo re-check before Firebas
 
 const normalizeTopic = (value) => {
   const topic = normalizeString(value)?.toLowerCase();
-  return NOTIFICATION_TOPICS.has(topic) ? topic : 'system';
+  return NOTIFICATION_TOPICS.has(topic) ? topic : null;
 };
 
 const normalizeNotificationPreferences = (preferences = {}) => {
@@ -160,6 +157,7 @@ const getSessionPreferences = async ({ userId, sessionId }) => {
 
 const isPushAllowedForPreferences = (preferences, topic) => {
   if (preferences.push_enabled === false) return false;
+  if (!topic) return true;
 
   const topics = preferences.topics || {};
   if (topics[topic] === false) return false;
