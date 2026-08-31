@@ -1564,11 +1564,38 @@ exports.createFolder = async (req, res, next) => {
   }
 };
 
-const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId }) => {
+const normalizeUploadConflictMode = (value) => {
+  const normalized = String(value || "replace").trim().toLowerCase();
+  if (["skip", "keep_both", "keep-both", "keepboth"].includes(normalized)) {
+    return normalized === "skip" ? "skip" : "keep_both";
+  }
+  return "replace";
+};
+
+const getUniqueUploadPath = async (filepath) => {
+  const cleanPath = canonicalizeWorkflowPath(filepath);
+  const segments = cleanPath.split("/").filter(Boolean);
+  const fileName = segments.pop() || "file";
+  const folderPath = segments.length ? `${segments.join("/")}/` : "";
+  const dotIndex = fileName.lastIndexOf(".");
+  const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+  const extension = dotIndex > 0 ? fileName.slice(dotIndex) : "";
+
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = `${folderPath}${baseName} (${index})${extension}`;
+    const exists = await FileMeta.exists({ path: candidate, isFolder: false });
+    if (!exists) return candidate;
+  }
+
+  return `${folderPath}${baseName} (${Date.now()})${extension}`;
+};
+
+const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId, conflictMode }) => {
   const cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "").trim();
   const normalizedFileSize = Number(fileSize || 0);
   const normalizedUserId = userId ? String(userId).trim() : null;
+  const uploadConflictMode = normalizeUploadConflictMode(conflictMode);
 
   if (!cleanPath || !cleanContentType || !normalizedFileSize) {
     return {
@@ -1589,7 +1616,7 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
-  const canonicalCleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
+  let canonicalCleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
 
   if (parseRevisionVersionNumber(canonicalCleanPath)) {
     const existingRevisionFile = await FileMeta.findOne({ path: canonicalCleanPath, isFolder: false })
@@ -1603,6 +1630,24 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
         filepath: canonicalCleanPath,
       };
     }
+  }
+
+  const existingFile = await FileMeta.findOne({ path: canonicalCleanPath, isFolder: false })
+    .select("_id")
+    .lean();
+  if (existingFile && uploadConflictMode === "skip") {
+    return {
+      ok: true,
+      skipped: true,
+      filepath: canonicalCleanPath,
+      data: {
+        skipped: true,
+        filepath: canonicalCleanPath,
+      },
+    };
+  }
+  if (existingFile && uploadConflictMode === "keep_both") {
+    canonicalCleanPath = await getUniqueUploadPath(canonicalCleanPath);
   }
 
   const result = await gcpFileService.uploadFile(
@@ -1774,6 +1819,7 @@ exports.getUploadPolicy = async (req, res, next) => {
       fileContentType: req.body.fileContentType,
       fileSize: req.body.fileSize,
       userId: req.body.userId,
+      conflictMode: req.body.conflictMode,
     });
 
     if (!result.ok) {
@@ -1785,7 +1831,10 @@ exports.getUploadPolicy = async (req, res, next) => {
 
     return res.status(httpStatus.OK).json({
       success: true,
-      data: result.data,
+      data: {
+        ...result.data,
+        filepath: result.filepath,
+      },
     });
   } catch (error) {
     return next(error);
@@ -1864,13 +1913,19 @@ exports.getUploadPoliciesBatch = async (req, res, next) => {
           fileContentType: item.fileContentType,
           fileSize: item.fileSize,
           userId: item.userId || req.body.userId,
+          conflictMode: item.conflictMode || req.body.conflictMode,
         });
 
         if (resolved.ok) {
           results.push({
-            filepath: resolved.filepath,
+            filepath: String(item.filepath || ""),
+            resolvedFilepath: resolved.filepath,
             success: true,
-            data: resolved.data,
+            skipped: !!resolved.skipped,
+            data: {
+              ...resolved.data,
+              filepath: resolved.filepath,
+            },
           });
         } else {
           results.push({
