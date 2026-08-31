@@ -92,6 +92,7 @@ const syncRoomKeysForUser = async (userId, newPublicKeyPem) => {
       "encryption.enabled": true,
       $or: [
         { client_id: userId },
+        { "client_ids.id": userId },
         { pm_id: userId },
         { "cp_ids.id": userId },
         { "production_ids.id": userId },
@@ -354,7 +355,7 @@ const getRoomKey = catchAsync(async (req, res) => {
   const { roomId } = req.params;
   const userId = req.user.id;
 
-  let chatRoom = await ChatRoom.findById(roomId).select("+encryption client_id pm_id cp_ids production_ids manager_ids");
+  let chatRoom = await ChatRoom.findById(roomId).select("+encryption client_id client_ids pm_id cp_ids production_ids manager_ids");
 
   if (!chatRoom) {
     throw new ApiError(httpStatus.NOT_FOUND, "Chat room not found");
@@ -415,7 +416,7 @@ const getPlainRoomKey = catchAsync(async (req, res) => {
   const { roomId } = req.params;
   const userId = req.user.id;
 
-  let chatRoom = await ChatRoom.findById(roomId).select("+encryption.room_key client_id pm_id cp_ids production_ids manager_ids");
+  let chatRoom = await ChatRoom.findById(roomId).select("+encryption.room_key client_id client_ids pm_id cp_ids production_ids manager_ids");
 
   if (!chatRoom) {
     throw new ApiError(httpStatus.NOT_FOUND, "Chat room not found");
@@ -425,6 +426,7 @@ const getPlainRoomKey = catchAsync(async (req, res) => {
   const userIdStr = userId.toString();
   const isParticipant =
     chatRoom.client_id?.toString() === userIdStr ||
+    chatRoom.client_ids?.some((client) => client.id?.toString() === userIdStr) ||
     chatRoom.pm_id?.toString() === userIdStr ||
     chatRoom.cp_ids?.some((cp) => cp.id?.toString() === userIdStr) ||
     chatRoom.production_ids?.some((p) => p.id?.toString() === userIdStr) ||
@@ -496,7 +498,7 @@ const checkRoomEncryptionStatus = catchAsync(async (req, res) => {
   const { roomId } = req.params;
   const userId = req.user.id;
 
-  const chatRoom = await ChatRoom.findById(roomId).select("encryption client_id pm_id cp_ids production_ids manager_ids");
+  const chatRoom = await ChatRoom.findById(roomId).select("encryption client_id client_ids pm_id cp_ids production_ids manager_ids");
 
   if (!chatRoom) {
     throw new ApiError(httpStatus.NOT_FOUND, "Chat room not found");
@@ -510,6 +512,11 @@ const checkRoomEncryptionStatus = catchAsync(async (req, res) => {
   // Collect all participant IDs
   const allParticipantIds = new Set();
   if (chatRoom.client_id) allParticipantIds.add(chatRoom.client_id.toString());
+  if (chatRoom.client_ids) {
+    chatRoom.client_ids.forEach((client) => {
+      if (client.id) allParticipantIds.add(client.id.toString());
+    });
+  }
   if (chatRoom.pm_id) allParticipantIds.add(chatRoom.pm_id.toString());
   if (chatRoom.cp_ids) {
     chatRoom.cp_ids.forEach((cp) => {
@@ -567,6 +574,11 @@ const reinitializeRoomEncryption = catchAsync(async (req, res) => {
   // Collect all participant IDs
   const allParticipantIds = new Set();
   if (chatRoom.client_id) allParticipantIds.add(chatRoom.client_id.toString());
+  if (chatRoom.client_ids) {
+    chatRoom.client_ids.forEach((client) => {
+      if (client.id) allParticipantIds.add(client.id.toString());
+    });
+  }
   if (chatRoom.pm_id) allParticipantIds.add(chatRoom.pm_id.toString());
   if (chatRoom.cp_ids) {
     chatRoom.cp_ids.forEach((cp) => {
@@ -640,7 +652,7 @@ const reinitializeRoomEncryption = catchAsync(async (req, res) => {
  */
 const migrateAllRoomEncryption = catchAsync(async (req, res) => {
   // Find rooms that either have no encryption or are missing the raw room_key
-  const rooms = await ChatRoom.find({}).select("+encryption _id client_id pm_id cp_ids production_ids manager_ids");
+  const rooms = await ChatRoom.find({}).select("+encryption _id client_id client_ids pm_id cp_ids production_ids manager_ids");
 
   let migrated = 0;
   let skipped = 0;
@@ -660,6 +672,7 @@ const migrateAllRoomEncryption = catchAsync(async (req, res) => {
       // Collect participant IDs
       const participantIds = new Set();
       if (room.client_id) participantIds.add(room.client_id.toString());
+      if (room.client_ids) room.client_ids.forEach((client) => { if (client.id) participantIds.add(client.id.toString()); });
       if (room.pm_id) participantIds.add(room.pm_id.toString());
       if (room.cp_ids) room.cp_ids.forEach((cp) => { if (cp.id) participantIds.add(cp.id.toString()); });
       if (room.production_ids) room.production_ids.forEach((p) => { if (p.id) participantIds.add(p.id.toString()); });

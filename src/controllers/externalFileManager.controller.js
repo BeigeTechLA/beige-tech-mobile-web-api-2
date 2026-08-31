@@ -108,6 +108,11 @@ const normalizeExternalId = (value) => String(value || "").trim();
 const isRootWorkspacePath = (value) => !String(value || "").replace(/\/$/, "").includes("/");
 const isCommonEventExternalId = (value) => normalizeExternalId(value).startsWith("event_");
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const normalizeFolderSegment = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -338,9 +343,34 @@ const listWorkspaceContents = async (basePath) => {
           fullPath: doc.fullPath,
           folderType: doc.folderType || null,
           fileCount: 0,
+          childFolderCount: 0,
           updatedAt: doc.updatedAt,
           createdAt: doc.createdAt,
         });
+      }
+      if (segments.length > 1) {
+        const directFolderName = segments[0];
+        const existingFolder = foldersMap.get(directFolderName);
+        if (existingFolder) {
+          existingFolder.childFolderCount = (existingFolder.childFolderCount || 0) + 1;
+          if (
+            doc.updatedAt &&
+            (!existingFolder.updatedAt || new Date(doc.updatedAt) > new Date(existingFolder.updatedAt))
+          ) {
+            existingFolder.updatedAt = doc.updatedAt;
+          }
+        } else {
+          foldersMap.set(directFolderName, {
+            name: directFolderName,
+            path: `${normalizedBasePath}${directFolderName}/`,
+            fullPath: `Website_Shoots_Flow/${normalizedBasePath}${directFolderName}/`,
+            folderType: null,
+            fileCount: 0,
+            childFolderCount: 1,
+            updatedAt: doc.updatedAt,
+            createdAt: doc.createdAt,
+          });
+        }
       }
       return;
     }
@@ -379,6 +409,7 @@ const listWorkspaceContents = async (basePath) => {
         fullPath: `Website_Shoots_Flow/${normalizedBasePath}${directFolderName}/`,
         folderType: null,
         fileCount: 1,
+        childFolderCount: 0,
         updatedAt: doc.updatedAt,
         createdAt: doc.createdAt,
       });
@@ -401,6 +432,22 @@ const normalizeWorkspacePath = (value) => {
   return normalized;
 };
 
+const canonicalizeWorkflowPath = (value) => {
+  const normalized = normalizeWorkspacePath(value);
+  if (!normalized) return "";
+
+  return normalized
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => {
+      const normalizedSegment = normalizeFolderSegment(segment);
+      if (normalizedSegment === "preproduction") return "Pre-Production";
+      if (normalizedSegment === "postproduction") return "Post-Production";
+      return segment;
+    })
+    .join("/");
+};
+
 const toMongoUserIdOrNull = (value) => {
   const normalized = String(value || "").trim();
   if (!normalized) return null;
@@ -410,30 +457,162 @@ const toMongoUserIdOrNull = (value) => {
 const getParentFolderMetadata = async (cleanPath) => {
   const pathParts = cleanPath.split("/").filter(Boolean);
   if (pathParts.length <= 1) {
-    return { parentFolder: null };
+    return { parentFolder: null, canonicalFolderPath: "" };
   }
 
   const folderPath = `${pathParts.slice(0, -1).join("/")}/`;
+  const folderPathWithoutTrailingSlash = folderPath.replace(/\/+$/, "");
   const cacheKey = folderPath.toLowerCase();
   const now = Date.now();
   const cached = parentFolderMetaCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return { parentFolder: cached.parentFolder };
+    return {
+      parentFolder: cached.parentFolder,
+      canonicalFolderPath: cached.canonicalFolderPath,
+    };
   }
 
-  const parentFolder = await FileMeta.findOne({
-    path: folderPath,
+  let parentFolder = await FileMeta.findOne({
+    path: { $in: [folderPath, folderPathWithoutTrailingSlash] },
     isFolder: true,
   })
     .select("_id path userId metadata")
     .lean();
 
+  if (!parentFolder) {
+    parentFolder = await FileMeta.findOne({
+      path: { $regex: `^${escapeRegex(folderPathWithoutTrailingSlash)}\\/?$`, $options: "i" },
+      isFolder: true,
+    })
+      .select("_id path userId metadata")
+      .sort({ updatedAt: -1 })
+      .lean();
+  }
+
+  const canonicalFolderPath = parentFolder?.path
+    ? `${String(parentFolder.path).replace(/\/+$/, "")}/`
+    : folderPath;
+
   parentFolderMetaCache.set(cacheKey, {
     parentFolder: parentFolder || null,
+    canonicalFolderPath,
     expiresAt: now + PARENT_FOLDER_CACHE_TTL_MS,
   });
 
-  return { parentFolder };
+  return { parentFolder, canonicalFolderPath };
+};
+
+const findFolderMetadataByPath = async (folderPath) => {
+  const cleanFolderPath = normalizeWorkspacePath(folderPath).replace(/\/+$/, "");
+  if (!cleanFolderPath) return null;
+
+  const exactPath = `${cleanFolderPath}/`;
+  const folder = await FileMeta.findOne({
+    path: { $in: [exactPath, cleanFolderPath] },
+    isFolder: true,
+  })
+    .select("_id path name userId metadata folderType")
+    .lean();
+
+  if (folder) return folder;
+
+  return FileMeta.findOne({
+    path: { $regex: `^${escapeRegex(cleanFolderPath)}\\/?$`, $options: "i" },
+    isFolder: true,
+  })
+    .select("_id path name userId metadata folderType")
+    .sort({ updatedAt: -1 })
+    .lean();
+};
+
+const ensureParentFolderMetadata = async (cleanPath) => {
+  const pathParts = normalizeWorkspacePath(cleanPath).split("/").filter(Boolean);
+  if (pathParts.length <= 1) {
+    return { parentFolder: null, canonicalFolderPath: "" };
+  }
+
+  const parentParts = pathParts.slice(0, -1);
+  const requestedParentPath = `${parentParts.join("/")}/`;
+  const existingParent = await getParentFolderMetadata(cleanPath);
+  if (existingParent.parentFolder) return existingParent;
+
+  let ancestorFolder = null;
+  let ancestorIndex = -1;
+
+  for (let index = parentParts.length - 1; index >= 0; index -= 1) {
+    const candidate = await findFolderMetadataByPath(`${parentParts.slice(0, index + 1).join("/")}/`);
+    if (candidate) {
+      ancestorFolder = candidate;
+      ancestorIndex = index;
+      break;
+    }
+  }
+
+  if (!ancestorFolder || ancestorIndex < 0) {
+    return { parentFolder: null, canonicalFolderPath: requestedParentPath };
+  }
+
+  let currentFolder = ancestorFolder;
+  let currentPath = `${String(ancestorFolder.path || "").replace(/\/+$/, "")}/`;
+  const touchedAt = new Date();
+
+  for (let index = ancestorIndex + 1; index < parentParts.length; index += 1) {
+    const normalizedSegment = normalizeFolderSegment(parentParts[index]);
+    const segment =
+      normalizedSegment === "preproduction"
+        ? "Pre-Production"
+        : normalizedSegment === "postproduction"
+          ? "Post-Production"
+          : parentParts[index];
+    currentPath = `${currentPath.replace(/\/+$/, "")}/${segment}/`;
+
+    let folderDoc = await FileMeta.findOne({
+      path: { $in: [currentPath, currentPath.replace(/\/+$/, "")] },
+      isFolder: true,
+    });
+
+    if (!folderDoc) {
+      folderDoc = await FileMeta.findOneAndUpdate(
+        {
+          path: currentPath,
+          isFolder: true,
+        },
+        {
+          $setOnInsert: {
+            path: currentPath,
+            name: segment,
+            userId: currentFolder.userId || null,
+            isFolder: true,
+            contentType: "folder",
+            size: 0,
+            isPublic: false,
+            fullPath: `Website_Shoots_Flow/${currentPath}`,
+            folderType: currentFolder.folderType || null,
+            parentFolderId: currentFolder._id,
+            metadata: {
+              ...(currentFolder.metadata || {}),
+              repairedFromUpload: true,
+            },
+            createdAt: touchedAt,
+          },
+        },
+        {
+          new: true,
+          upsert: true,
+          setDefaultsOnInsert: true,
+        }
+      );
+    }
+
+    currentFolder = folderDoc.toObject ? folderDoc.toObject() : folderDoc;
+  }
+
+  parentFolderMetaCache.delete(requestedParentPath.toLowerCase());
+
+  return {
+    parentFolder: currentFolder,
+    canonicalFolderPath: `${String(currentFolder.path || requestedParentPath).replace(/\/+$/, "")}/`,
+  };
 };
 
 const resolveWorkspaceBasePath = (workspacePath, phase, subPath) => {
@@ -1086,6 +1265,7 @@ exports.createWorkspace = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
     const folderName = String(req.body.folderName || "").trim();
+    const skipWorkflowSubfolders = Boolean(req.body.skipWorkflowSubfolders);
 
     if (!externalId || !folderName) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -1094,7 +1274,16 @@ exports.createWorkspace = async (req, res, next) => {
       });
     }
 
-    await gcpFileService.createFolder(folderName, null, externalId, null);
+    await gcpFileService.createFolder(
+      folderName,
+      null,
+      externalId,
+      null,
+      null,
+      null,
+      null,
+      { skipWorkflowSubfolders }
+    );
     const workspace = await findWorkspaceRoot(externalId);
 
     if (!workspace) {
@@ -1216,6 +1405,70 @@ exports.getWorkspaceFiles = async (req, res, next) => {
   }
 };
 
+exports.getEntryMetadata = async (req, res, next) => {
+  try {
+    const filePath = normalizeWorkspacePath(req.query.filepath || req.query.path || "");
+
+    if (!filePath) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "filepath is required",
+      });
+    }
+
+    const pathWithSlash = filePath.endsWith("/") ? filePath : `${filePath}/`;
+    const pathWithoutSlash = filePath.endsWith("/") ? filePath.slice(0, -1) : filePath;
+    const escapedRoot = escapeRegex(pathWithoutSlash);
+
+    const entry = await FileMeta.findOne({
+      $or: [
+        { path: pathWithSlash },
+        { path: pathWithoutSlash },
+      ],
+    })
+      .select("_id path name isFolder contentType size author metadata createdAt updatedAt")
+      .lean();
+
+    if (!entry) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Entry not found",
+      });
+    }
+
+    let oldestFile = null;
+    if (entry.isFolder) {
+      oldestFile = await FileMeta.findOne({
+        isFolder: false,
+        path: { $regex: `^${escapedRoot}/` },
+      })
+        .select("path name createdAt updatedAt")
+        .sort({ createdAt: 1, updatedAt: 1 })
+        .lean();
+    }
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        id: entry._id.toString(),
+        path: entry.path,
+        name: entry.name,
+        isFolder: Boolean(entry.isFolder),
+        contentType: entry.contentType || "",
+        size: entry.size || 0,
+        author: entry.author || "Unknown",
+        metadata: entry.metadata || {},
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+        oldestFileCreatedAt: oldestFile?.createdAt || null,
+        oldestFilePath: oldestFile?.path || null,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.createFolder = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
@@ -1311,11 +1564,38 @@ exports.createFolder = async (req, res, next) => {
   }
 };
 
-const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId }) => {
-  const cleanPath = normalizeWorkspacePath(filepath);
+const normalizeUploadConflictMode = (value) => {
+  const normalized = String(value || "replace").trim().toLowerCase();
+  if (["skip", "keep_both", "keep-both", "keepboth"].includes(normalized)) {
+    return normalized === "skip" ? "skip" : "keep_both";
+  }
+  return "replace";
+};
+
+const getUniqueUploadPath = async (filepath) => {
+  const cleanPath = canonicalizeWorkflowPath(filepath);
+  const segments = cleanPath.split("/").filter(Boolean);
+  const fileName = segments.pop() || "file";
+  const folderPath = segments.length ? `${segments.join("/")}/` : "";
+  const dotIndex = fileName.lastIndexOf(".");
+  const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+  const extension = dotIndex > 0 ? fileName.slice(dotIndex) : "";
+
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = `${folderPath}${baseName} (${index})${extension}`;
+    const exists = await FileMeta.exists({ path: candidate, isFolder: false });
+    if (!exists) return candidate;
+  }
+
+  return `${folderPath}${baseName} (${Date.now()})${extension}`;
+};
+
+const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize, userId, conflictMode }) => {
+  const cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "").trim();
   const normalizedFileSize = Number(fileSize || 0);
   const normalizedUserId = userId ? String(userId).trim() : null;
+  const uploadConflictMode = normalizeUploadConflictMode(conflictMode);
 
   if (!cleanPath || !cleanContentType || !normalizedFileSize) {
     return {
@@ -1326,7 +1606,7 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
-  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  const { parentFolder, canonicalFolderPath } = await ensureParentFolderMetadata(cleanPath);
   if (!parentFolder) {
     return {
       ok: false,
@@ -1336,8 +1616,10 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
     };
   }
 
-  if (parseRevisionVersionNumber(cleanPath)) {
-    const existingRevisionFile = await FileMeta.findOne({ path: cleanPath, isFolder: false })
+  let canonicalCleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
+
+  if (parseRevisionVersionNumber(canonicalCleanPath)) {
+    const existingRevisionFile = await FileMeta.findOne({ path: canonicalCleanPath, isFolder: false })
       .select("_id metadata")
       .lean();
     if (existingRevisionFile) {
@@ -1345,13 +1627,31 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
         ok: false,
         code: httpStatus.CONFLICT,
         error: "This version is already uploaded. Ask the client to request a revision before uploading the next version.",
-        filepath: cleanPath,
+        filepath: canonicalCleanPath,
       };
     }
   }
 
+  const existingFile = await FileMeta.findOne({ path: canonicalCleanPath, isFolder: false })
+    .select("_id")
+    .lean();
+  if (existingFile && uploadConflictMode === "skip") {
+    return {
+      ok: true,
+      skipped: true,
+      filepath: canonicalCleanPath,
+      data: {
+        skipped: true,
+        filepath: canonicalCleanPath,
+      },
+    };
+  }
+  if (existingFile && uploadConflictMode === "keep_both") {
+    canonicalCleanPath = await getUniqueUploadPath(canonicalCleanPath);
+  }
+
   const result = await gcpFileService.uploadFile(
-    `Website_Shoots_Flow/${cleanPath}`.replace(/\/+/g, "/"),
+    `Website_Shoots_Flow/${canonicalCleanPath}`.replace(/\/+/g, "/"),
     cleanContentType,
     normalizedFileSize,
     normalizedUserId,
@@ -1362,7 +1662,7 @@ const resolveUploadPolicyForFile = async ({ filepath, fileContentType, fileSize,
 
   return {
     ok: true,
-    filepath: cleanPath,
+    filepath: canonicalCleanPath,
     data: result,
   };
 };
@@ -1376,28 +1676,32 @@ const completeUploadMetadataForFile = async ({
   authorName,
   providerTimeoutMs,
 }) => {
-  const cleanPath = normalizeWorkspacePath(filepath);
+  let cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "application/octet-stream").trim();
   const normalizedFileSize = Number(fileSize || 0);
-  const cleanFileName = String(fileName || cleanPath.split("/").pop() || "").trim();
   const normalizedUserId = userId ? String(userId).trim() : null;
   const cleanAuthorName = String(authorName || "Beige User").trim();
   const mongoUserId = toMongoUserIdOrNull(normalizedUserId);
 
-  if (!cleanPath || !normalizedUserId) {
+  if (!cleanPath) {
     return {
       ok: false,
       code: httpStatus.BAD_REQUEST,
-      error: "filepath and userId are required",
+      error: "filepath is required",
       filepath: cleanPath || String(filepath || ""),
     };
   }
 
-  const { parentFolder } = await getParentFolderMetadata(cleanPath);
+  const { parentFolder, canonicalFolderPath } = await ensureParentFolderMetadata(cleanPath);
+  if (parentFolder && canonicalFolderPath) {
+    cleanPath = `${canonicalFolderPath}${cleanPath.split("/").filter(Boolean).pop()}`;
+  }
+  const cleanFileName = String(fileName || cleanPath.split("/").pop() || "").trim();
   const folderMetadata = {
     cpIds: parentFolder?.metadata?.cpIds || [],
     orderId: parentFolder?.metadata?.orderId || null,
     externalUserId: normalizedUserId,
+    uploadedByEmail: !normalizedUserId && cleanAuthorName.includes("@") ? cleanAuthorName : null,
   };
   const revisionVersionNumber = parseRevisionVersionNumber(cleanPath);
   const revisionUploadMetadata = revisionVersionNumber
@@ -1420,6 +1724,8 @@ const completeUploadMetadataForFile = async ({
       ...existingFile.metadata,
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      externalUserId: folderMetadata.externalUserId,
+      uploadedByEmail: folderMetadata.uploadedByEmail,
       ...revisionUploadMetadata,
     };
     // A file replaced at the same path belongs to the latest completed upload.
@@ -1440,7 +1746,7 @@ const completeUploadMetadataForFile = async ({
       cleanPath,
       fileName: existingFile.name || cleanFileName,
       uploadedByName: cleanAuthorName,
-      uploadedById: normalizedUserId,
+      uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
     });
 
     return {
@@ -1468,6 +1774,8 @@ const completeUploadMetadataForFile = async ({
     metadata: {
       cpIds: folderMetadata.cpIds,
       orderId: folderMetadata.orderId,
+      externalUserId: folderMetadata.externalUserId,
+      uploadedByEmail: folderMetadata.uploadedByEmail,
       ...revisionUploadMetadata,
     },
     createdAt: touchedAt,
@@ -1489,7 +1797,7 @@ const completeUploadMetadataForFile = async ({
     cleanPath,
     fileName: fileDoc.name || cleanFileName,
     uploadedByName: cleanAuthorName,
-    uploadedById: normalizedUserId,
+    uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
   });
 
   return {
@@ -1511,6 +1819,7 @@ exports.getUploadPolicy = async (req, res, next) => {
       fileContentType: req.body.fileContentType,
       fileSize: req.body.fileSize,
       userId: req.body.userId,
+      conflictMode: req.body.conflictMode,
     });
 
     if (!result.ok) {
@@ -1522,7 +1831,10 @@ exports.getUploadPolicy = async (req, res, next) => {
 
     return res.status(httpStatus.OK).json({
       success: true,
-      data: result.data,
+      data: {
+        ...result.data,
+        filepath: result.filepath,
+      },
     });
   } catch (error) {
     return next(error);
@@ -1601,13 +1913,19 @@ exports.getUploadPoliciesBatch = async (req, res, next) => {
           fileContentType: item.fileContentType,
           fileSize: item.fileSize,
           userId: item.userId || req.body.userId,
+          conflictMode: item.conflictMode || req.body.conflictMode,
         });
 
         if (resolved.ok) {
           results.push({
-            filepath: resolved.filepath,
+            filepath: String(item.filepath || ""),
+            resolvedFilepath: resolved.filepath,
             success: true,
-            data: resolved.data,
+            skipped: !!resolved.skipped,
+            data: {
+              ...resolved.data,
+              filepath: resolved.filepath,
+            },
           });
         } else {
           results.push({

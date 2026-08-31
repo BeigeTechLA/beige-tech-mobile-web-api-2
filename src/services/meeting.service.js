@@ -7,10 +7,22 @@ const { sendNotification } = require("./fcm.service");
 const { createNotificationData, insertNotification } = require('../services/notification.service');
 const sendgridService = require("./sendgrid.service");
 const { MEETING_SCHEDULED_TEMPLATE_ID } = require("../config/sendgridTemplates");
+const logger = require("../config/logger");
 
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const MEETING_PUSH_TOPIC = {
+  topic: "meetings",
+  category: "meetings",
+};
 
 const asIdString = (value) => (value == null ? "" : String(value).trim());
+
+const normalizeNotificationUserId = (value) => {
+  if (value && typeof value === "object") {
+    return asIdString(value.id || value._id || value.user_id || value.userId);
+  }
+  return asIdString(value);
+};
 
 const gatherMeetingIncludedUserIds = (meeting, order) => {
   const userIdSet = new Set();
@@ -1573,6 +1585,9 @@ const createMeeting = async (reqBody) => {
     delete reqBody.order_id;
     const sendNotification_flag = reqBody.send_notification;
     delete reqBody.send_notification;
+    const requestedCpIds = Array.isArray(reqBody.cp_ids)
+      ? reqBody.cp_ids.map(normalizeNotificationUserId).filter(Boolean)
+      : [];
     const meeting = await Meeting.create(reqBody);
     
     // Add the meeting ID to the order's meeting_date_times array
@@ -1585,6 +1600,7 @@ const createMeeting = async (reqBody) => {
       const notificationTitle = "New meeting has been scheduled";
       const notificationContent = `A new meeting has been scheduled for order '${order.order_name}'`;
       const notificationData = {
+        ...MEETING_PUSH_TOPIC,
         type: "newMeeting",
         meetingId: meeting._id.toString(),
         id: meeting._id.toString(),
@@ -1616,20 +1632,34 @@ const createMeeting = async (reqBody) => {
         }
       });
 
-      // Send notifications to all CPs
+      // Send notifications to CPs from the request and from the linked order.
+      // External clients can pass app user ids (e.g. "825") that are used by FCM.
       const cpIdsForNotification = [];
+      const cpIdsForPush = new Set();
+
+      requestedCpIds.forEach((cpId) => cpIdsForPush.add(cpId));
       order.cp_ids.forEach((cp) => {
         if (cp.decision !== "cancelled") {
-          const cpId = cp.id.toString();
-          cpIdsForNotification.push(cp.id);
-          // Send FCM push notification to the CP
-          sendNotification(
-            cpId,
-            notificationTitle,
-            notificationContent,
-            notificationData
-          );
+          const cpId = normalizeNotificationUserId(cp);
+          if (cpId) cpIdsForPush.add(cpId);
         }
+      });
+
+      logger.info(`[Meeting] Create notification recipients ${JSON.stringify({
+        meeting_id: meeting._id.toString(),
+        order_id: order._id.toString(),
+        requested_cp_ids: requestedCpIds,
+        final_cp_ids: [...cpIdsForPush],
+      })}`);
+
+      cpIdsForPush.forEach((cpId) => {
+        cpIdsForNotification.push(cpId);
+        sendNotification(
+          cpId,
+          notificationTitle,
+          notificationContent,
+          notificationData
+        );
       });
 
       // Create in-app notification for all active CPs
@@ -1860,6 +1890,7 @@ const placeChangeRequest = async (meetingId, reqBody) => {
 
     // Send FCM push notification to client
     sendNotification(order.client_id, notificationTitle, NotificationContent, {
+      ...MEETING_PUSH_TOPIC,
       type: "meetingScheduleUpdateRequest",
       meetingId: meetingId.toString(),
       id: meetingId.toString(),
@@ -1892,6 +1923,7 @@ const placeChangeRequest = async (meetingId, reqBody) => {
       if (cp.decision !== "cancelled") {
         cpIdsForNotification.push(cp.id);
         sendNotification(cp.id.toString(), notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleUpdateRequest",
           meetingId: meetingId.toString(),
           id: meetingId.toString(),
@@ -2005,6 +2037,7 @@ const sendMeetingStatusUpdateNotification = async (
       const notificationTitle = "Meeting Status Update";
       const NotificationContent = `The status of meeting for order '${order.order_name}' has transitioned from ${currentMeetingStatus} to ${meeting.meeting_status}`;
       const notificationData = {
+        ...MEETING_PUSH_TOPIC,
         type: "meetingStatusUpdate",
         meetingId: meeting._id.toString(),
         id: meeting._id.toString(),
@@ -2087,6 +2120,7 @@ const sendMeetingStatusUpdateNotification = async (
         const cpId = cp.id.toString();
         cpIdsForNotification.push(cp.id);
         sendNotification(cpId, notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleChangeRequestStatusUpdate",
           meetingId: meeting._id.toString(),
           id: meeting._id.toString(),
@@ -2117,6 +2151,7 @@ const sendMeetingStatusUpdateNotification = async (
       // Also notify client about reschedule request status
       if (order.client_id) {
         sendNotification(order.client_id, notificationTitle, NotificationContent, {
+          ...MEETING_PUSH_TOPIC,
           type: "meetingScheduleChangeRequestStatusUpdate",
           meetingId: meeting._id.toString(),
           id: meeting._id.toString(),
@@ -2189,6 +2224,7 @@ const addMeetingParticipants = async (meetingId, participantData) => {
     const notificationTitle = "Added to Meeting";
     const notificationContent = `You have been added as a participant to a meeting`;
     const notificationData = {
+      ...MEETING_PUSH_TOPIC,
       type: "participantAdded",
       meetingId: meeting._id.toString(),
       id: meeting._id.toString(),
@@ -2276,6 +2312,7 @@ const removeMeetingParticipant = async (meetingId, userId, role) => {
     const notificationTitle = "Removed from Meeting";
     const notificationContent = `You have been removed as a participant from a meeting`;
     const notificationData = {
+      ...MEETING_PUSH_TOPIC,
       type: "participantRemoved",
       meetingId: meeting._id.toString(),
       id: meeting._id.toString(),

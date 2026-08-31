@@ -7,6 +7,7 @@ const router = express.Router();
 router.get("/get-files/:userId", auth(), gcpFileController.getFiles);
 router.get("/getChatfiles", gcpFileController.getChatFiles);
 router.get("/download-folder", gcpFileController.downloadFolder);
+router.post("/download-selected", gcpFileController.downloadSelectedFiles);
 router.post("/chatFile", gcpFileController.uploadChatFiles);
 // Upload chat file directly to GCP (with file buffer via multer)
 router.post("/chat-upload", upload('file'), gcpFileController.uploadChatFileToGcp);

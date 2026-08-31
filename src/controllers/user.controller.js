@@ -80,8 +80,22 @@ const deleteUser = catchAsync(async (req, res) => {
 const updateFCMToken = catchAsync(async (req, res) => {
   const { registrationToken } = req.body;
   const { userId } = req.params;
-  const updatedToken = await fcmService.saveFCMToken(userId, registrationToken);
+  const updatedToken = await fcmService.saveFCMToken(userId, registrationToken, {
+    session_id: req.body.session_id,
+    device_type: req.body.device_type || req.headers.device_type,
+    app_user_type: req.body.app_user_type,
+    notification_preferences: req.body.notification_preferences,
+  });
   res.send(updatedToken);
+});
+
+const removeFCMToken = catchAsync(async (req, res) => {
+  const { registrationToken } = req.body;
+  const { userId } = req.params;
+  await fcmService.removeFCMToken(userId, registrationToken, {
+    session_id: req.body.session_id,
+  });
+  res.status(httpStatus.NO_CONTENT).send();
 });
 
 /**
@@ -104,5 +118,6 @@ module.exports = {
   updateUser,
   deleteUser,
   updateFCMToken,
+  removeFCMToken,
   getStaffList,
 };

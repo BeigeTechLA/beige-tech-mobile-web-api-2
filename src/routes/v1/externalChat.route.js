@@ -5,6 +5,95 @@ const { getIO, notifyAllParticipants } = require("../../services/socket.service"
 
 const router = express.Router();
 
+const getPlainRoom = (room) => {
+  if (!room) return room;
+  if (typeof room.toJSON === "function") return room.toJSON({ flattenMaps: true });
+  if (typeof room.toObject === "function") return room.toObject({ flattenMaps: true });
+  return room;
+};
+
+const normalizeParticipantId = (value) => {
+  const id = String(value?.id || value?._id || value || "").trim();
+  return id || null;
+};
+
+const getParticipantNotificationIds = (value) => {
+  if (!value) return [];
+
+  if (typeof value === "string" || typeof value === "number") {
+    const id = String(value).trim();
+    return id ? [id] : [];
+  }
+
+  const ids = [
+    value.id,
+    value._id,
+    value.user_id,
+    value.userId,
+    value.client_id,
+    value.clientId,
+    value.crew_member_id,
+    value.crewMemberId,
+    value.email,
+  ]
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+
+  return ids;
+};
+
+const getRoomParticipantIds = (room) => {
+  const plainRoom = getPlainRoom(room) || {};
+  const participantIds = new Set();
+
+  [
+    plainRoom.client_id,
+    plainRoom.client_snapshot,
+    plainRoom.pm_id,
+    ...(Array.isArray(plainRoom.cp_ids) ? plainRoom.cp_ids : []),
+    ...(Array.isArray(plainRoom.manager_ids) ? plainRoom.manager_ids : []),
+    ...(Array.isArray(plainRoom.production_ids) ? plainRoom.production_ids : []),
+  ].forEach((participant) => {
+    getParticipantNotificationIds(participant).forEach((id) => participantIds.add(id));
+  });
+
+  return [...participantIds];
+};
+
+const emitExternalChatRoomCreated = ({ chatRoom, createdBy }) => {
+  const io = getIO();
+  const room = getPlainRoom(chatRoom);
+  const roomId = normalizeParticipantId(room);
+  if (!io || !roomId || !room) return;
+
+  const payload = {
+    success: true,
+    type: "addedToChat",
+    event: "chatRoomCreated",
+    roomId,
+    chatRoomId: roomId,
+    orderId: room.order_id ? String(room.order_id) : undefined,
+    externalOrderRef: room.external_order_ref || undefined,
+    name: room.name || "",
+    room,
+    createdBy: createdBy || null,
+    createdAt: room.createdAt || new Date().toISOString(),
+  };
+
+  getRoomParticipantIds(room).forEach((userId) => {
+    const userRoom = `user_${userId}`;
+    io.to(userRoom).emit("chatRoomCreated", payload);
+    io.to(userRoom).emit("notification:new", payload);
+  });
+
+  io.emit("updateChatRoom", {
+    roomId,
+    chatRoomId: roomId,
+    type: "chatRoomCreated",
+    success: true,
+  });
+};
+
 const emitExternalChatMessage = ({ roomId, savedMessage, senderId, senderName }) => {
   const io = getIO();
   if (!io || !roomId || !savedMessage) return;
@@ -99,6 +188,10 @@ router.get("/rooms", chatController.getChatRooms);
 router.post("/room", async (req, res) => {
   try {
     const chatRoom = await chatService.createChatRoom(req.body, req.body.adminUser || req.body.adminId || null);
+    emitExternalChatRoomCreated({
+      chatRoom,
+      createdBy: req.body.adminUser || req.body.adminId || null,
+    });
     res.status(201).send(chatRoom);
   } catch (error) {
     res.status(error.statusCode || 500).send({
@@ -275,7 +368,9 @@ const deleteMessageHandler = async (req, res) => {
       });
     }
 
-    const updated = await chatService.softDeleteMessage(req.params.messageId, String(deleterId));
+    const updated = await chatService.softDeleteMessage(req.params.messageId, String(deleterId), {
+      allowAnySender: Boolean(req.body.allowAnySender),
+    });
     const roomId = String(
       updated?.chat_room_id || updated?.chatRoomId || req.body.roomId || req.body.chat_room_id || ""
     );

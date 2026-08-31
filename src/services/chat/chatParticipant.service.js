@@ -202,25 +202,30 @@ const addParticipants = async (chatRoomId, participantData, adminId, adminName) 
 
       switch (role) {
         case 'client':
-          if (
-            chatRoom.client_id?.toString() !== String(user.id) &&
-            chatRoom.client_snapshot?.id?.toString() !== String(user.id)
-          ) {
-            if (mongoose.Types.ObjectId.isValid(String(user.id))) {
-              chatRoom.client_id = user.id;
-              chatRoom.client_snapshot = undefined;
-            } else {
+          {
+            const primaryClientId = resolveStoredParticipantId(chatRoom.client_id);
+            const snapshotClientId = resolveStoredParticipantId(chatRoom.client_snapshot);
+            const existingExtraClient = (chatRoom.client_ids || []).find(
+              (client) => resolveStoredParticipantId(client) === String(user.id)
+            );
+
+            if (
+              primaryClientId !== String(user.id) &&
+              snapshotClientId !== String(user.id) &&
+              !existingExtraClient
+            ) {
               participantEntry.role = 'client';
-              chatRoom.client_snapshot = participantEntry;
-            }
-            addedUserIds.push(user.id);
-            addedUserNames.push(user.name);
-            if (user.email) {
-              addedParticipantEmails.push({
-                email: user.email,
-                name: user.name,
-                role: participantEntry.role || role || "client",
-              });
+              chatRoom.client_ids = chatRoom.client_ids || [];
+              chatRoom.client_ids.push(participantEntry);
+              addedUserIds.push(user.id);
+              addedUserNames.push(user.name);
+              if (user.email) {
+                addedParticipantEmails.push({
+                  email: user.email,
+                  name: user.name,
+                  role: participantEntry.role || role || "client",
+                });
+              }
             }
           }
           break;
@@ -433,6 +438,22 @@ const removeParticipant = async (chatRoomId, userId, role, adminId, adminName) =
           removed = true;
         }
         break;
+      case 'client':
+        if (resolveStoredParticipantId(chatRoom.client_id) === normalizedUserId) {
+          throw new ApiError(httpStatus.BAD_REQUEST, "Primary booking client cannot be removed");
+        }
+
+        if (resolveStoredParticipantId(chatRoom.client_snapshot) === normalizedUserId) {
+          throw new ApiError(httpStatus.BAD_REQUEST, "Primary booking client cannot be removed");
+        }
+
+        const clientIndex = chatRoom.client_ids?.findIndex((client) => resolveStoredParticipantId(client) === normalizedUserId);
+        if (clientIndex !== -1 && clientIndex !== undefined) {
+          removedParticipant = chatRoom.client_ids[clientIndex];
+          chatRoom.client_ids.splice(clientIndex, 1);
+          removed = true;
+        }
+        break;
       default:
         throw new ApiError(httpStatus.BAD_REQUEST, "Invalid role specified");
     }
@@ -469,6 +490,7 @@ const removeParticipant = async (chatRoomId, userId, role, adminId, adminName) =
     await chatRoom.save();
 
     const roleLabel = normalizedRole === 'cp' ? 'Creative Partner' :
+                      normalizedRole === 'client' ? 'Client' :
                       normalizedRole === 'pm' ? 'Project Manager' :
                       normalizedRole === 'production' ? 'Production Team' : 'Admin';
 
@@ -517,16 +539,26 @@ const getChatParticipants = async (chatRoomId) => {
 
     const pm = chatRoom.pm_id ? await toParticipantPayload(chatRoom.pm_id, 'pm') : null;
 
+    const snapshotClient = await toParticipantPayload(chatRoom.client_snapshot, 'client');
     const client = chatRoom.client_id
       ? {
           ...(chatRoom.client_id.toObject ? chatRoom.client_id.toObject() : chatRoom.client_id),
           id: chatRoom.client_id?._id?.toString?.() || chatRoom.client_id?.id,
           role: 'client',
+          is_primary_client: true,
         }
-      : await toParticipantPayload(chatRoom.client_snapshot, 'client');
+      : snapshotClient
+        ? {
+            ...snapshotClient,
+            is_primary_client: true,
+          }
+        : null;
+
+    const extraClients = await Promise.all((chatRoom.client_ids || []).map((clientItem) => toParticipantPayload(clientItem, 'client')));
 
     return {
       client,
+      clients: [client, ...extraClients].filter(Boolean),
       cps: await Promise.all((chatRoom.cp_ids || []).map((cp) => toParticipantPayload(cp, 'cp'))),
       pm,
       production: await Promise.all((chatRoom.production_ids || []).map((p) => toParticipantPayload(p, 'production'))),
@@ -548,6 +580,8 @@ const isParticipant = async (chatRoomId, userId) => {
     const userIdStr = userId.toString();
 
     if (chatRoom.client_id?.toString() === userIdStr) return true;
+    if (chatRoom.client_snapshot?.id?.toString() === userIdStr) return true;
+    if (chatRoom.client_ids?.some((client) => resolveStoredParticipantId(client) === userIdStr)) return true;
     if (chatRoom.pm_id?.toString() === userIdStr) return true;
     if (chatRoom.cp_ids?.some(cp => cp.id.toString() === userIdStr)) return true;
     if (chatRoom.production_ids?.some(p => p.id.toString() === userIdStr)) return true;

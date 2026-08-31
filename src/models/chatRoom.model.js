@@ -45,6 +45,34 @@ const chatRoomSchema = new mongoose.Schema(
         default: "client",
       },
     },
+    client_ids: [
+      {
+        id: {
+          type: mongoose.Schema.Types.Mixed,
+          required: true,
+        },
+        name: {
+          type: String,
+          required: false,
+        },
+        email: {
+          type: String,
+          required: false,
+        },
+        added_at: {
+          type: Date,
+          default: Date.now,
+        },
+        added_by: {
+          type: mongoose.Schema.Types.Mixed,
+        },
+        role: {
+          type: String,
+          required: false,
+          default: "client",
+        },
+      },
+    ],
     cp_ids: [
       {
         id: {
@@ -239,6 +267,7 @@ chatRoomSchema.plugin(toJSON);
 chatRoomSchema.plugin(paginate);
 chatRoomSchema.plugin(paginateChat);
 chatRoomSchema.index({ client_id: 1 });
+chatRoomSchema.index({ "client_ids.id": 1 });
 
 const ChatRoomModel = mongoose.model("ChatRoom", chatRoomSchema);
 

@@ -63,6 +63,7 @@ const encryptionRoute = require('./encryption.route');
 const externalFileManagerRoute = require('./externalFileManager.route');
 const externalChatRoute = require('./externalChat.route');
 const externalMeetingsRoute = require('./externalMeetings.route');
+const internalPushRoute = require('./internalPush.route');
 
 const router = express.Router();
 
@@ -310,6 +311,10 @@ const defaultRoutes = [
   {
     path: '/encryption',
     route: encryptionRoute,
+  },
+  {
+    path: '/internal/push',
+    route: internalPushRoute,
   },
 ];
 errorRoute;
