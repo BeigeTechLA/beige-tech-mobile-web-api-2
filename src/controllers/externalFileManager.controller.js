@@ -1369,6 +1369,70 @@ exports.getWorkspaceFiles = async (req, res, next) => {
   }
 };
 
+exports.getEntryMetadata = async (req, res, next) => {
+  try {
+    const filePath = normalizeWorkspacePath(req.query.filepath || req.query.path || "");
+
+    if (!filePath) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "filepath is required",
+      });
+    }
+
+    const pathWithSlash = filePath.endsWith("/") ? filePath : `${filePath}/`;
+    const pathWithoutSlash = filePath.endsWith("/") ? filePath.slice(0, -1) : filePath;
+    const escapedRoot = escapeRegex(pathWithoutSlash);
+
+    const entry = await FileMeta.findOne({
+      $or: [
+        { path: pathWithSlash },
+        { path: pathWithoutSlash },
+      ],
+    })
+      .select("_id path name isFolder contentType size author metadata createdAt updatedAt")
+      .lean();
+
+    if (!entry) {
+      return res.status(httpStatus.NOT_FOUND).json({
+        success: false,
+        message: "Entry not found",
+      });
+    }
+
+    let oldestFile = null;
+    if (entry.isFolder) {
+      oldestFile = await FileMeta.findOne({
+        isFolder: false,
+        path: { $regex: `^${escapedRoot}/` },
+      })
+        .select("path name createdAt updatedAt")
+        .sort({ createdAt: 1, updatedAt: 1 })
+        .lean();
+    }
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        id: entry._id.toString(),
+        path: entry.path,
+        name: entry.name,
+        isFolder: Boolean(entry.isFolder),
+        contentType: entry.contentType || "",
+        size: entry.size || 0,
+        author: entry.author || "Unknown",
+        metadata: entry.metadata || {},
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+        oldestFileCreatedAt: oldestFile?.createdAt || null,
+        oldestFilePath: oldestFile?.path || null,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.createFolder = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
