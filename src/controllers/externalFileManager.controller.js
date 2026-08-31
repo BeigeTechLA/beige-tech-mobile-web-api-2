@@ -343,9 +343,34 @@ const listWorkspaceContents = async (basePath) => {
           fullPath: doc.fullPath,
           folderType: doc.folderType || null,
           fileCount: 0,
+          childFolderCount: 0,
           updatedAt: doc.updatedAt,
           createdAt: doc.createdAt,
         });
+      }
+      if (segments.length > 1) {
+        const directFolderName = segments[0];
+        const existingFolder = foldersMap.get(directFolderName);
+        if (existingFolder) {
+          existingFolder.childFolderCount = (existingFolder.childFolderCount || 0) + 1;
+          if (
+            doc.updatedAt &&
+            (!existingFolder.updatedAt || new Date(doc.updatedAt) > new Date(existingFolder.updatedAt))
+          ) {
+            existingFolder.updatedAt = doc.updatedAt;
+          }
+        } else {
+          foldersMap.set(directFolderName, {
+            name: directFolderName,
+            path: `${normalizedBasePath}${directFolderName}/`,
+            fullPath: `Website_Shoots_Flow/${normalizedBasePath}${directFolderName}/`,
+            folderType: null,
+            fileCount: 0,
+            childFolderCount: 1,
+            updatedAt: doc.updatedAt,
+            createdAt: doc.createdAt,
+          });
+        }
       }
       return;
     }
@@ -384,6 +409,7 @@ const listWorkspaceContents = async (basePath) => {
         fullPath: `Website_Shoots_Flow/${normalizedBasePath}${directFolderName}/`,
         folderType: null,
         fileCount: 1,
+        childFolderCount: 0,
         updatedAt: doc.updatedAt,
         createdAt: doc.createdAt,
       });
@@ -1239,6 +1265,7 @@ exports.createWorkspace = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
     const folderName = String(req.body.folderName || "").trim();
+    const skipWorkflowSubfolders = Boolean(req.body.skipWorkflowSubfolders);
 
     if (!externalId || !folderName) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -1247,7 +1274,16 @@ exports.createWorkspace = async (req, res, next) => {
       });
     }
 
-    await gcpFileService.createFolder(folderName, null, externalId, null);
+    await gcpFileService.createFolder(
+      folderName,
+      null,
+      externalId,
+      null,
+      null,
+      null,
+      null,
+      { skipWorkflowSubfolders }
+    );
     const workspace = await findWorkspaceRoot(externalId);
 
     if (!workspace) {
