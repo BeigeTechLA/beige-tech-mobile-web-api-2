@@ -24,6 +24,7 @@ router.post("/workspace", externalFileManagerController.createWorkspace);
 router.get("/workspace/:externalId", externalFileManagerController.getWorkspace);
 router.get("/workspace/:externalId/files", externalFileManagerController.getWorkspaceFiles);
 router.get("/entry-metadata", externalFileManagerController.getEntryMetadata);
+router.get("/folder-activity-logs", externalFileManagerController.getFolderActivityLogs);
 router.post("/folder", externalFileManagerController.createFolder);
 router.post("/face-scan/query-upload-policy", externalFileManagerController.getFaceScanQueryUploadPolicy);
 router.post("/upload-policy", externalFileManagerController.getUploadPolicy);
