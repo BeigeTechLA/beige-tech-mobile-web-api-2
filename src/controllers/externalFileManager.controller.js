@@ -1,6 +1,6 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
+const { FileMeta, FileActivityLog, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
 const { ensurePostProductionFolder } = gcpFileService;
@@ -430,6 +430,94 @@ const normalizeWorkspacePath = (value) => {
     normalized = normalized.replace(/^shoots\//, "");
   }
   return normalized;
+};
+
+const getParentPathFromWorkspacePath = (value) => {
+  const normalized = normalizeWorkspacePath(value).replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 1) return normalized ? `${normalized}/` : "";
+  return `${parts.slice(0, -1).join("/")}/`;
+};
+
+const getRootPathFromWorkspacePath = (value) => {
+  const firstSegment = normalizeWorkspacePath(value).split("/").filter(Boolean)[0] || "";
+  return firstSegment ? `${firstSegment}/` : "";
+};
+
+const normalizeActivityActor = (payload = {}) => ({
+  actorUserId: payload.userId ? String(payload.userId).trim() : null,
+  actorName: String(payload.authorName || payload.userName || payload.name || "Unknown").trim() || "Unknown",
+  actorEmail: payload.userEmail ? String(payload.userEmail).trim() : null,
+});
+
+const toActivityFile = (entry = {}) => ({
+  path: normalizeWorkspacePath(entry.path || entry.filepath || ""),
+  name: String(entry.name || entry.fileName || normalizeWorkspacePath(entry.path || "").split("/").pop() || "").trim(),
+  size: Number(entry.size || entry.fileSize || 0),
+  contentType: String(entry.contentType || entry.fileContentType || ""),
+  isFolder: Boolean(entry.isFolder),
+});
+
+const createFileActivityLog = async ({
+  folderPath,
+  action,
+  actor = {},
+  files = [],
+  targetPath = "",
+  targetName = "",
+  targetIsFolder = false,
+  metadata = {},
+}) => {
+  const normalizedFolderPath = normalizeWorkspacePath(folderPath).replace(/\/?$/, "/");
+  const normalizedTargetPath = normalizeWorkspacePath(targetPath);
+  const activityFiles = files.map(toActivityFile).filter((file) => file.path || file.name);
+  const totalSize = activityFiles.reduce((sum, file) => sum + Number(file.size || 0), 0);
+
+  if (!normalizedFolderPath || !action || activityFiles.length === 0) return null;
+
+  return FileActivityLog.create({
+    folderPath: normalizedFolderPath,
+    rootPath: getRootPathFromWorkspacePath(normalizedFolderPath),
+    action,
+    actorUserId: actor.actorUserId || null,
+    actorName: actor.actorName || "Unknown",
+    actorEmail: actor.actorEmail || null,
+    fileCount: activityFiles.filter((file) => !file.isFolder).length || activityFiles.length,
+    totalSize,
+    targetPath: normalizedTargetPath || activityFiles[0]?.path || "",
+    targetName: targetName || activityFiles[0]?.name || "",
+    targetIsFolder,
+    files: activityFiles.slice(0, 1000),
+    metadata: {
+      ...metadata,
+      originalFileCount: activityFiles.length,
+      truncated: activityFiles.length > 1000,
+    },
+  });
+};
+
+const createUploadActivityLogs = async (items = [], actor = {}) => {
+  const grouped = new Map();
+
+  items.forEach((item) => {
+    const folderPath = getParentPathFromWorkspacePath(item.path || item.filepath || "");
+    if (!folderPath) return;
+    if (!grouped.has(folderPath)) grouped.set(folderPath, []);
+    grouped.get(folderPath).push(item);
+  });
+
+  await Promise.all(
+    Array.from(grouped.entries()).map(([folderPath, files]) =>
+      createFileActivityLog({
+        folderPath,
+        action: "upload",
+        actor,
+        files,
+        targetPath: folderPath,
+        targetName: folderPath.split("/").filter(Boolean).pop() || "",
+      })
+    )
+  );
 };
 
 const canonicalizeWorkflowPath = (value) => {
@@ -1469,6 +1557,94 @@ exports.getEntryMetadata = async (req, res, next) => {
   }
 };
 
+exports.getFolderActivityLogs = async (req, res, next) => {
+  try {
+    const folderPath = normalizeWorkspacePath(req.query.folderPath || req.query.path || "");
+    const rootPath = normalizeWorkspacePath(req.query.rootPath || "");
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
+    const action = String(req.query.action || "").trim().toLowerCase();
+
+    if (!folderPath && !rootPath) {
+      return res.status(httpStatus.BAD_REQUEST).json({
+        success: false,
+        message: "folderPath or rootPath is required",
+      });
+    }
+
+    const query = {};
+    if (folderPath) {
+      query.folderPath = folderPath.endsWith("/") ? folderPath : `${folderPath}/`;
+    } else {
+      query.rootPath = rootPath.endsWith("/") ? rootPath : `${rootPath}/`;
+    }
+    if (["upload", "delete"].includes(action)) {
+      query.action = action;
+    }
+
+    const [logs, total, uploadSummary, deleteSummary] = await Promise.all([
+      FileActivityLog.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      FileActivityLog.countDocuments(query),
+      FileActivityLog.aggregate([
+        { $match: { ...query, action: "upload" } },
+        {
+          $group: {
+            _id: { actorUserId: "$actorUserId", actorName: "$actorName" },
+            fileCount: { $sum: "$fileCount" },
+            totalSize: { $sum: "$totalSize" },
+            events: { $sum: 1 },
+          },
+        },
+        { $sort: { fileCount: -1 } },
+      ]),
+      FileActivityLog.aggregate([
+        { $match: { ...query, action: "delete" } },
+        {
+          $group: {
+            _id: { actorUserId: "$actorUserId", actorName: "$actorName" },
+            fileCount: { $sum: "$fileCount" },
+            totalSize: { $sum: "$totalSize" },
+            events: { $sum: 1 },
+          },
+        },
+        { $sort: { fileCount: -1 } },
+      ]),
+    ]);
+
+    const mapSummary = (rows) =>
+      rows.map((row) => ({
+        userId: row._id.actorUserId,
+        name: row._id.actorName || "Unknown",
+        fileCount: row.fileCount || 0,
+        totalSize: row.totalSize || 0,
+        events: row.events || 0,
+      }));
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: {
+        logs,
+        summary: {
+          uploads: mapSummary(uploadSummary),
+          deletes: mapSummary(deleteSummary),
+        },
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.createFolder = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
@@ -1675,6 +1851,7 @@ const completeUploadMetadataForFile = async ({
   userId,
   authorName,
   providerTimeoutMs,
+  skipActivityLog = false,
 }) => {
   let cleanPath = canonicalizeWorkflowPath(filepath);
   const cleanContentType = String(fileContentType || "application/octet-stream").trim();
@@ -1749,6 +1926,18 @@ const completeUploadMetadataForFile = async ({
       uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
     });
 
+    if (!skipActivityLog) {
+      await createUploadActivityLogs(
+        [{
+          path: existingFile.path,
+          name: existingFile.name || cleanFileName,
+          size: existingFile.size,
+          contentType: existingFile.contentType,
+        }],
+        normalizeActivityActor({ userId: normalizedUserId, authorName: cleanAuthorName })
+      );
+    }
+
     return {
       ok: true,
       created: false,
@@ -1757,6 +1946,7 @@ const completeUploadMetadataForFile = async ({
         path: existingFile.path,
         name: existingFile.name,
         size: existingFile.size,
+        contentType: existingFile.contentType,
       },
     };
   }
@@ -1800,6 +1990,18 @@ const completeUploadMetadataForFile = async ({
     uploadedById: normalizedUserId || folderMetadata.uploadedByEmail || '',
   });
 
+  if (!skipActivityLog) {
+    await createUploadActivityLogs(
+      [{
+        path: fileDoc.path,
+        name: fileDoc.name || cleanFileName,
+        size: fileDoc.size,
+        contentType: fileDoc.contentType,
+      }],
+      normalizeActivityActor({ userId: normalizedUserId, authorName: cleanAuthorName })
+    );
+  }
+
   return {
     ok: true,
     created: true,
@@ -1808,6 +2010,7 @@ const completeUploadMetadataForFile = async ({
       path: fileDoc.path,
       name: fileDoc.name,
       size: fileDoc.size,
+      contentType: fileDoc.contentType,
     },
   };
 };
@@ -2011,6 +2214,7 @@ exports.completeUploadsBatch = async (req, res, next) => {
           userId: item.userId || req.body.userId,
           authorName: item.authorName || req.body.authorName,
           providerTimeoutMs: item.providerTimeoutMs || req.body.providerTimeoutMs,
+          skipActivityLog: true,
         });
 
         if (completed.ok) {
@@ -2037,6 +2241,26 @@ exports.completeUploadsBatch = async (req, res, next) => {
         });
       }
     });
+
+    const uploadedItems = results
+      .filter((item) => item.success && item.data)
+      .map((item) => ({
+        path: item.data.path,
+        name: item.data.name,
+        size: item.data.size,
+        contentType: item.data.contentType,
+      }));
+
+    if (uploadedItems.length) {
+      await createUploadActivityLogs(
+        uploadedItems,
+        normalizeActivityActor({
+          userId: req.body.userId,
+          authorName: req.body.authorName,
+          userEmail: req.body.userEmail,
+        })
+      );
+    }
 
     return res.status(httpStatus.OK).json({
       success: true,
@@ -3054,6 +3278,7 @@ exports.getFolderDownloadUrl = async (req, res, next) => {
 exports.deleteEntry = async (req, res, next) => {
   try {
     const filePath = normalizeWorkspacePath(req.body.filepath || req.body.path || "");
+    const actor = normalizeActivityActor(req.body);
 
     if (!filePath) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -3075,8 +3300,6 @@ exports.deleteEntry = async (req, res, next) => {
       ? effectivePath
       : `Website_Shoots_Flow/${effectivePath}`;
 
-    const result = await gcpFileService.deleteFile(targetPath);
-
     const escapedRoot = pathWithoutSlash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pathRegex = new RegExp(`^${escapedRoot}/`);
     const extraDeleteFilter = {
@@ -3097,16 +3320,37 @@ exports.deleteEntry = async (req, res, next) => {
       });
     }
 
+    const recordsToDelete = await FileMeta.find(extraDeleteFilter)
+      .select("path name size contentType isFolder")
+      .lean();
+    const deletedFiles = recordsToDelete.filter((record) => !record.isFolder);
+    const activityFiles = deletedFiles.length ? deletedFiles : recordsToDelete;
+
+    const result = await gcpFileService.deleteFile(targetPath);
     const metadataCleanup = await FileMeta.deleteMany(extraDeleteFilter);
     const embeddingCleanup = await FaceEmbedding.deleteMany({
       $or: [{ filepath: pathWithoutSlash }, { filepath: pathWithSlash }, { filepath: pathRegex }],
+    });
+
+    await createFileActivityLog({
+      folderPath: isFolderDelete ? pathWithSlash : getParentPathFromWorkspacePath(filePath),
+      action: "delete",
+      actor,
+      files: activityFiles,
+      targetPath: filePath,
+      targetName: (isFolderDelete ? folderDoc?.name : filePath.split("/").pop()) || "",
+      targetIsFolder: isFolderDelete,
+      metadata: {
+        metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
+        embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
+      },
     });
 
     return res.status(httpStatus.OK).json({
       success: true,
       data: {
         ...result,
-        metadataDeletedCount: metadataCleanup.deletedCount || 0,
+        metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
         embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
       },
     });
