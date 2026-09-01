@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const { FileMeta, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
+const fileActivityLogService = require("../services/fileActivityLog.service");
 const { ensurePostProductionFolder } = gcpFileService;
 const sendgridService = require("../services/sendgrid.service");
 const {
@@ -308,6 +309,33 @@ const toWorkspaceSummary = (doc, fileCount = 0, updatedAt = null) => ({
   createdAt: doc.createdAt,
   updatedAt: updatedAt || doc.updatedAt,
 });
+
+const getPerformedBy = (req) =>
+  req.body?.performedBy ||
+  req.body?.performedByName ||
+  req.body?.performedById ||
+  req.query?.performedBy ||
+  req.headers["x-user-name"] ||
+  req.headers["x-user-id"] ||
+  null;
+
+const getFolderClientName = (folderDoc, workspaceDoc) =>
+  folderDoc?.metadata?.clientName ||
+  workspaceDoc?.metadata?.clientName ||
+  workspaceDoc?.name ||
+  null;
+
+const logFolderActivity = async ({ action, folderDoc, workspaceDoc, folderPath, folderName, stage, req }) => {
+  await fileActivityLogService.createFileActivityLog({
+    clientId: folderDoc?.metadata?.orderId || workspaceDoc?.metadata?.orderId || null,
+    clientName: getFolderClientName(folderDoc, workspaceDoc),
+    action,
+    folderName: folderName || folderDoc?.name,
+    folderPath: folderPath || folderDoc?.path,
+    stage,
+    performedBy: getPerformedBy(req),
+  });
+};
 
 const findWorkspaceRoot = async (externalId) =>
   FileMeta.findOne({
@@ -1469,6 +1497,32 @@ exports.getEntryMetadata = async (req, res, next) => {
   }
 };
 
+exports.getHistory = async (req, res, next) => {
+  try {
+    const logs = await fileActivityLogService.queryFileActivityLogs(
+      {
+        clientId: req.query.clientId,
+        stage: req.query.stage,
+        action: req.query.action,
+        startDate: req.query.startDate || req.query.from,
+        endDate: req.query.endDate || req.query.to,
+      },
+      {
+        page: req.query.page,
+        limit: req.query.limit,
+        sortBy: req.query.sortBy || "createdAt:desc",
+      }
+    );
+
+    return res.status(httpStatus.OK).json({
+      success: true,
+      data: logs,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.createFolder = async (req, res, next) => {
   try {
     const externalId = normalizeExternalId(req.body.externalId);
@@ -1548,6 +1602,18 @@ exports.createFolder = async (req, res, next) => {
         success: false,
         message: result.error === "file-exists" ? "Folder already exists" : "Failed to create folder",
         error: result.error,
+      });
+    }
+
+    if (!result?.alreadyExists) {
+      await logFolderActivity({
+        action: "created",
+        folderDoc: createdFolderDoc,
+        workspaceDoc: workspace,
+        folderPath: createdFolderPath,
+        folderName: cleanFolderName,
+        stage: phase,
+        req,
       });
     }
 
@@ -3101,6 +3167,18 @@ exports.deleteEntry = async (req, res, next) => {
     const embeddingCleanup = await FaceEmbedding.deleteMany({
       $or: [{ filepath: pathWithoutSlash }, { filepath: pathWithSlash }, { filepath: pathRegex }],
     });
+
+    if (isFolderDelete) {
+      await logFolderActivity({
+        action: "deleted",
+        folderDoc,
+        workspaceDoc: null,
+        folderPath: pathWithSlash,
+        folderName: folderDoc.name,
+        stage: fileActivityLogService.inferStageFromPath(pathWithSlash),
+        req,
+      });
+    }
 
     return res.status(httpStatus.OK).json({
       success: true,
