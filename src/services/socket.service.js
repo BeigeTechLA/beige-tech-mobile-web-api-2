@@ -31,6 +31,22 @@ const findMongoUserIfPossible = async (candidateUserId, projection = "_id isActi
   return User.findById(normalized).select(projection);
 };
 
+const resolveStoredParticipantId = (value, depth = 0) => {
+  if (value == null || depth > 4) return null;
+  if (typeof value === "string" || typeof value === "number") {
+    const id = String(value).trim();
+    return id || null;
+  }
+
+  const candidates = [value._id, value.id, value.user_id, value.userId, value.email];
+  for (const candidate of candidates) {
+    const id = resolveStoredParticipantId(candidate, depth + 1);
+    if (id && id !== "[object Object]") return id;
+  }
+
+  return null;
+};
+
 // Function to emit notifications to specific users
 function emitNotificationToUser(userId, notification) {
   if (ioInstance && userId) {
@@ -898,17 +914,23 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
     }
 
     logger.info(`notifyAllParticipants: Processing room ${roomId}, sender: ${senderId}`);
-    logger.info(`ChatRoom participants: client_id=${chatRoom.client_id}, client_ids=${JSON.stringify(chatRoom.client_ids)}, pm_id=${chatRoom.pm_id}, cp_ids=${JSON.stringify(chatRoom.cp_ids)}, manager_ids=${JSON.stringify(chatRoom.manager_ids)}, production_ids=${JSON.stringify(chatRoom.production_ids)}`);
+    logger.info(`ChatRoom participants: client_id=${chatRoom.client_id}, client_snapshot=${JSON.stringify(chatRoom.client_snapshot)}, client_ids=${JSON.stringify(chatRoom.client_ids)}, pm_id=${chatRoom.pm_id}, cp_ids=${JSON.stringify(chatRoom.cp_ids)}, manager_ids=${JSON.stringify(chatRoom.manager_ids)}, production_ids=${JSON.stringify(chatRoom.production_ids)}`);
 
     const participantIds = [];
 
     // Collect all participant IDs
-    if (chatRoom.client_id && chatRoom.client_id.toString() !== senderId) {
-      participantIds.push(chatRoom.client_id.toString());
+    const primaryClientId = resolveStoredParticipantId(chatRoom.client_id);
+    const snapshotClientId = resolveStoredParticipantId(chatRoom.client_snapshot);
+
+    if (primaryClientId && primaryClientId !== senderId) {
+      participantIds.push(primaryClientId);
+    }
+    if (snapshotClientId && snapshotClientId !== senderId) {
+      participantIds.push(snapshotClientId);
     }
     if (chatRoom.client_ids) {
       chatRoom.client_ids.forEach(client => {
-        const clientId = client.id?.toString();
+        const clientId = resolveStoredParticipantId(client);
         if (clientId && clientId !== senderId) {
           participantIds.push(clientId);
         }
@@ -961,12 +983,15 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
 
     // Separate participants by role for database notification
     const clientIds = [];
-    if (chatRoom.client_id && chatRoom.client_id.toString() !== senderId) {
-      clientIds.push(chatRoom.client_id.toString());
+    if (primaryClientId && primaryClientId !== senderId) {
+      clientIds.push(primaryClientId);
+    }
+    if (snapshotClientId && snapshotClientId !== senderId) {
+      clientIds.push(snapshotClientId);
     }
     if (chatRoom.client_ids) {
       chatRoom.client_ids.forEach(client => {
-        const clientId = client.id?.toString();
+        const clientId = resolveStoredParticipantId(client);
         if (clientId && clientId !== senderId) {
           clientIds.push(clientId);
         }
