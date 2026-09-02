@@ -14,6 +14,15 @@ const stringifyDataPayload = (data = {}) => {
   }, {});
 };
 
+const getAndroidChannelId = () =>
+  normalizeString(process.env.FCM_ANDROID_CHANNEL_ID) ||
+  normalizeString(process.env.FIREBASE_ANDROID_CHANNEL_ID) ||
+  'default_channel';
+
+const getAndroidClickAction = () =>
+  normalizeString(process.env.FCM_ANDROID_CLICK_ACTION) ||
+  'FLUTTER_NOTIFICATION_CLICK';
+
 const buildFcmHttpV1Payload = ({ token, title, body, data = {} }) => {
   const normalizedToken = normalizeString(token);
   const normalizedTitle = normalizeString(title);
@@ -38,6 +47,32 @@ const buildFcmHttpV1Payload = ({ token, title, body, data = {} }) => {
 
   if (!message.notification && !message.data) {
     throw new Error('notification or data payload is required.');
+  }
+
+  message.android = {
+    priority: 'HIGH',
+    ...(message.notification ? {
+      notification: {
+        channel_id: getAndroidChannelId(),
+        click_action: getAndroidClickAction(),
+        sound: 'default',
+      },
+    } : {}),
+  };
+
+  if (message.notification) {
+    message.apns = {
+      headers: {
+        'apns-push-type': 'alert',
+        'apns-priority': '10',
+      },
+      payload: {
+        aps: {
+          sound: 'default',
+          badge: 1,
+        },
+      },
+    };
   }
 
   return { message };
