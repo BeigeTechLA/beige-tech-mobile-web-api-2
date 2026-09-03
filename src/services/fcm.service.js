@@ -461,6 +461,7 @@ const logMessageDeliveryStatus = (response) => {
  * @throws {Error} If there's a critical error during the notification sending process, this function may throw an error.
  */
 const sendNotification = async (userId, title, content, customData) => {
+  /*
   return new Promise(async (resolve) => {
     try {
       const normalizedUserId = normalizeString(userId);
@@ -639,6 +640,20 @@ const sendNotification = async (userId, title, content, customData) => {
       });
     }
   });
+  */
+
+  logger.info(`[FCM] Notification trigger commented out ${JSON.stringify({
+    user_id: normalizeString(userId),
+    title,
+    topic: normalizeTopic(customData?.topic || customData?.category || customData?.type),
+    type: customData?.type || null,
+  })}`);
+
+  return {
+    success: false,
+    skipped: true,
+    reason: 'NOTIFICATION_TRIGGER_COMMENTED_OUT',
+  };
 };
 
 /**
