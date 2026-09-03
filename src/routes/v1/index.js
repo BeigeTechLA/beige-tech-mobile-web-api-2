@@ -61,11 +61,47 @@ const portfolioRoute = require('./portfolio.route');
 const frameioRoute = require('./frameio.route');
 const encryptionRoute = require('./encryption.route');
 const externalFileManagerRoute = require('./externalFileManager.route');
+const externalFileManagerController = require("../../controllers/externalFileManager.controller");
 const externalChatRoute = require('./externalChat.route');
 const externalMeetingsRoute = require('./externalMeetings.route');
 const internalPushRoute = require('./internalPush.route');
 
 const router = express.Router();
+
+const requireInternalFileManagerKey = (req, res, next) => {
+  const providedKey = req.headers["x-internal-key"];
+  const expectedKey = process.env.INTERNAL_FILE_MANAGER_KEY || "beige-internal-dev-key";
+
+  if (!providedKey || providedKey !== expectedKey) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid internal integration key",
+    });
+  }
+
+  return next();
+};
+
+router.get(
+  "/admin/file-manager/deletion-requests",
+  requireInternalFileManagerKey,
+  externalFileManagerController.listDeletionRequests
+);
+router.post(
+  "/admin/file-manager/deletion-requests/:id/approve",
+  requireInternalFileManagerKey,
+  externalFileManagerController.approveDeletionRequest
+);
+router.post(
+  "/admin/file-manager/deletion-requests/:id/reject",
+  requireInternalFileManagerKey,
+  externalFileManagerController.rejectDeletionRequest
+);
+router.post(
+  "/file-manager/folders/:folderId/deletion-request",
+  requireInternalFileManagerKey,
+  externalFileManagerController.requestFolderDeletion
+);
 
 const defaultRoutes = [
   {

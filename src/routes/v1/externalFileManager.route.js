@@ -25,7 +25,11 @@ router.get("/workspace/:externalId", externalFileManagerController.getWorkspace)
 router.get("/workspace/:externalId/files", externalFileManagerController.getWorkspaceFiles);
 router.get("/entry-metadata", externalFileManagerController.getEntryMetadata);
 router.get("/folder-activity-logs", externalFileManagerController.getFolderActivityLogs);
+router.get("/admin/file-manager/deletion-requests", externalFileManagerController.listDeletionRequests);
+router.post("/admin/file-manager/deletion-requests/:id/approve", externalFileManagerController.approveDeletionRequest);
+router.post("/admin/file-manager/deletion-requests/:id/reject", externalFileManagerController.rejectDeletionRequest);
 router.post("/folder", externalFileManagerController.createFolder);
+router.post("/file-manager/folders/:folderId/deletion-request", externalFileManagerController.requestFolderDeletion);
 router.post("/face-scan/query-upload-policy", externalFileManagerController.getFaceScanQueryUploadPolicy);
 router.post("/upload-policy", externalFileManagerController.getUploadPolicy);
 router.post("/upload-policies/batch", externalFileManagerController.getUploadPoliciesBatch);

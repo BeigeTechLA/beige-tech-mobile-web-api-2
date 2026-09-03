@@ -11,6 +11,7 @@ module.exports.Dispute = require("./dispute.model");
 module.exports.File = require("./file.model");
 module.exports.FileMeta = require("./fileMeta.model");
 module.exports.FileActivityLog = require("./fileActivityLog.model");
+module.exports.FolderDeletionRequest = require("./folderDeletionRequest.model");
 module.exports.FaceEmbedding = require("./faceEmbedding.model");
 module.exports.FaceScanJob = require("./faceScanJob.model");
 module.exports.FaceScanIndexJob = require("./faceScanIndexJob.model");

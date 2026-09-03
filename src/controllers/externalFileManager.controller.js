@@ -1,6 +1,15 @@
 const httpStatus = require("http-status");
 const mongoose = require("mongoose");
-const { FileMeta, FileActivityLog, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
+const {
+  FileMeta,
+  FileActivityLog,
+  FolderDeletionRequest,
+  FaceEmbedding,
+  FaceScanJob,
+  Order,
+  Booking,
+  Notification,
+} = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
 const { ensurePostProductionFolder } = gcpFileService;
@@ -77,6 +86,10 @@ const FACE_SCAN_QUERY_UPLOAD_PREFIX = String(
 const FACE_SCAN_QUERY_IMAGE_MAX_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.FACE_SCAN_QUERY_IMAGE_MAX_BYTES || 8 * 1024 * 1024)
+);
+const CP_FOLDER_DELETE_WINDOW_DAYS = Math.max(
+  0,
+  Number(process.env.FILE_MANAGER_CP_DELETE_WINDOW_DAYS || process.env.CP_FOLDER_DELETE_WINDOW_DAYS || 0)
 );
 const FACE_SCAN_MAX_RESULTS_LIMIT = Math.max(
   50,
@@ -492,6 +505,130 @@ const createFileActivityLog = async ({
       ...metadata,
       originalFileCount: activityFiles.length,
       truncated: activityFiles.length > 1000,
+    },
+  });
+};
+
+const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(String(value || ""));
+
+const getActorObjectId = (actor = {}) => (
+  actor.actorUserId && isValidObjectId(actor.actorUserId) ? actor.actorUserId : null
+);
+
+const canActorAccessFolder = (folderDoc, actor = {}) => {
+  const actorId = String(actor.actorUserId || "").trim();
+  if (!actorId || !folderDoc) return false;
+  if (String(folderDoc.userId || "") === actorId) return true;
+
+  const cpIds = folderDoc.metadata?.cpIds || [];
+  return cpIds.some((cp) => {
+    if (!cp) return false;
+    if (typeof cp === "string") return cp === actorId;
+    return String(cp.id || cp._id || cp.userId || "") === actorId;
+  });
+};
+
+const isWithinCpDeleteWindow = (folderDoc) => {
+  if (!CP_FOLDER_DELETE_WINDOW_DAYS) return false;
+  const createdAt = folderDoc?.createdAt ? new Date(folderDoc.createdAt).getTime() : 0;
+  if (!createdAt) return false;
+  return Date.now() - createdAt <= CP_FOLDER_DELETE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+};
+
+const getFolderDeleteFilter = (filePath, folderDoc) => {
+  const pathWithSlash = filePath.endsWith("/") ? filePath : `${filePath}/`;
+  const pathWithoutSlash = filePath.endsWith("/") ? filePath.slice(0, -1) : filePath;
+  const escapedRoot = pathWithoutSlash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pathRegex = new RegExp(`^${escapedRoot}/`);
+  const extraDeleteFilter = {
+    $or: [
+      { path: pathWithSlash },
+      { path: pathWithoutSlash },
+      { path: pathRegex },
+    ],
+  };
+
+  const orderId = folderDoc?.metadata?.orderId;
+  if (orderId && isRootWorkspacePath(pathWithoutSlash)) {
+    extraDeleteFilter.$or.push({
+      isFolder: true,
+      parentFolderId: null,
+      path: { $regex: /^[^/]+\/?$/ },
+      "metadata.orderId": String(orderId),
+    });
+  }
+
+  return { pathWithSlash, pathWithoutSlash, pathRegex, extraDeleteFilter };
+};
+
+const getFolderSnapshot = async (filePath, folderDoc) => {
+  const { extraDeleteFilter } = getFolderDeleteFilter(filePath, folderDoc);
+  const records = await FileMeta.find(extraDeleteFilter)
+    .select("path name size contentType isFolder")
+    .lean();
+  const fileRecords = records.filter((record) => !record.isFolder);
+  return {
+    records,
+    file_count: fileRecords.length,
+    total_size_bytes: fileRecords.reduce((sum, record) => sum + Number(record.size || 0), 0),
+  };
+};
+
+const createDeletionNotification = async ({ request, cpId, message, metadata = {} }) => {
+  if (!cpId || !isValidObjectId(cpId)) return null;
+  return Notification.create({
+    modelName: "FolderDeletionRequest",
+    modelId: request._id,
+    cpIds: [cpId],
+    message,
+    category: "FolderDeletionRequest",
+    metadata,
+  });
+};
+
+const serializeDeletionRequest = (request) => ({
+  id: request._id?.toString(),
+  title: request.title,
+  creative: request.requested_by_user_id && typeof request.requested_by_user_id === "object"
+    ? {
+        id: request.requested_by_user_id._id?.toString(),
+        name: request.requested_by_user_id.name || "Unknown",
+      }
+    : { id: String(request.requested_by_user_id || ""), name: "Unknown" },
+  project: request.project_id || request.event_id || "NA",
+  reason: request.reason,
+  description: request.description || "NA",
+  status: request.status,
+  file_count: request.file_count || 0,
+  total_size_bytes: request.total_size_bytes || 0,
+  requested_at: request.requested_at,
+  reviewed_by: request.reviewed_by_user_id && typeof request.reviewed_by_user_id === "object"
+    ? {
+        id: request.reviewed_by_user_id._id?.toString(),
+        name: request.reviewed_by_user_id.name || "Unknown",
+      }
+    : null,
+  reviewed_at: request.reviewed_at || null,
+  reject_reason: request.reject_reason || null,
+});
+
+const createDeletionReviewAuditLog = async ({ request, action, actor, rejectReason = null }) => {
+  const folderDoc = await FileMeta.findById(request.folder_id).select("path name").lean();
+  const folderPath = normalizeWorkspacePath(folderDoc?.path || request.title).replace(/\/?$/, "/");
+  const folderName = folderDoc?.name || request.title;
+
+  return createFileActivityLog({
+    folderPath,
+    action,
+    actor,
+    files: [{ path: folderPath, name: folderName, isFolder: true, size: request.total_size_bytes }],
+    targetPath: folderPath,
+    targetName: folderName,
+    targetIsFolder: true,
+    metadata: {
+      deletionRequestId: request._id.toString(),
+      folderId: request.folder_id?.toString(),
+      rejectReason,
     },
   });
 };
@@ -3275,6 +3412,212 @@ exports.getFolderDownloadUrl = async (req, res, next) => {
   }
 };
 
+const hardDeleteEntry = async ({ filePath, actor, approvedRequest = null }) => {
+  const pathWithSlash = filePath.endsWith("/") ? filePath : `${filePath}/`;
+  const pathWithoutSlash = filePath.endsWith("/") ? filePath.slice(0, -1) : filePath;
+  const folderDoc = await FileMeta.findOne({
+    isFolder: true,
+    path: { $in: [pathWithSlash, pathWithoutSlash] },
+  }).lean();
+
+  const isFolderDelete = Boolean(folderDoc?.isFolder);
+  const effectivePath = isFolderDelete ? pathWithSlash : filePath;
+  const targetPath = effectivePath.startsWith("Website_Shoots_Flow/")
+    ? effectivePath
+    : `Website_Shoots_Flow/${effectivePath}`;
+  const { pathRegex, extraDeleteFilter } = getFolderDeleteFilter(filePath, folderDoc);
+
+  const recordsToDelete = await FileMeta.find(extraDeleteFilter)
+    .select("path name size contentType isFolder")
+    .lean();
+  const deletedFiles = recordsToDelete.filter((record) => !record.isFolder);
+  const activityFiles = deletedFiles.length ? deletedFiles : recordsToDelete;
+
+  const result = await gcpFileService.deleteFile(targetPath);
+  const metadataCleanup = await FileMeta.deleteMany(extraDeleteFilter);
+  const embeddingCleanup = await FaceEmbedding.deleteMany({
+    $or: [{ filepath: pathWithoutSlash }, { filepath: pathWithSlash }, { filepath: pathRegex }],
+  });
+
+  if (approvedRequest) {
+    approvedRequest.status = "completed";
+    await approvedRequest.save();
+  }
+
+  await createFileActivityLog({
+    folderPath: isFolderDelete ? pathWithSlash : getParentPathFromWorkspacePath(filePath),
+    action: "delete",
+    actor,
+    files: activityFiles,
+    targetPath: filePath,
+    targetName: (isFolderDelete ? folderDoc?.name : filePath.split("/").pop()) || "",
+    targetIsFolder: isFolderDelete,
+    metadata: {
+      deletionRequestId: approvedRequest?._id?.toString(),
+      metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
+      embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
+    },
+  });
+
+  return {
+    ...result,
+    metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
+    embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
+  };
+};
+
+exports.listDeletionRequests = async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
+    const status = String(req.query.status || "pending").toLowerCase();
+    const search = String(req.query.search || "").trim();
+    const query = {};
+
+    if (!["pending", "approved", "rejected", "completed", "all"].includes(status)) {
+      return res.status(httpStatus.BAD_REQUEST).json({ success: false, message: "Invalid status filter" });
+    }
+    if (status !== "all") query.status = status;
+    if (search) {
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      query.$or = [{ title: regex }, { reason: regex }, { description: regex }, { project_id: regex }, { event_id: regex }];
+    }
+
+    const sort = String(req.query.sort || "requested_at desc").toLowerCase().includes("asc")
+      ? { requested_at: 1 }
+      : { requested_at: -1 };
+    const [requests, total] = await Promise.all([
+      FolderDeletionRequest.find(query)
+        .populate("requested_by_user_id", "name email")
+        .populate("reviewed_by_user_id", "name email")
+        .sort(sort)
+        .skip((page - 1) * limit)
+        .limit(limit),
+      FolderDeletionRequest.countDocuments(query),
+    ]);
+
+    return res.status(httpStatus.OK).json({
+      data: requests.map(serializeDeletionRequest),
+      pagination: { page, limit, total },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.approveDeletionRequest = async (req, res, next) => {
+  try {
+    const actor = normalizeActivityActor(req.body);
+    const request = await FolderDeletionRequest.findById(req.params.id);
+    if (!request) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Deletion request not found" });
+    if (request.status !== "pending") return res.status(httpStatus.CONFLICT).json({ success: false, message: "Deletion request already reviewed" });
+
+    request.status = "approved";
+    request.reviewed_by_user_id = getActorObjectId(actor);
+    request.reviewed_at = new Date();
+    await request.save();
+
+    await createDeletionReviewAuditLog({
+      request,
+      action: "deletion_request_approved",
+      actor,
+    });
+    await createDeletionNotification({
+      request,
+      cpId: request.requested_by_user_id,
+      message: "Your delete request was approved - you can now delete this folder.",
+    });
+
+    return res.status(httpStatus.OK).json({ success: true, data: serializeDeletionRequest(request) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.rejectDeletionRequest = async (req, res, next) => {
+  try {
+    const actor = normalizeActivityActor(req.body);
+    const request = await FolderDeletionRequest.findById(req.params.id);
+    if (!request) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Deletion request not found" });
+    if (request.status !== "pending") return res.status(httpStatus.CONFLICT).json({ success: false, message: "Deletion request already reviewed" });
+
+    request.status = "rejected";
+    request.reject_reason = String(req.body.reject_reason || "").trim() || null;
+    request.reviewed_by_user_id = getActorObjectId(actor);
+    request.reviewed_at = new Date();
+    await request.save();
+
+    await createDeletionReviewAuditLog({
+      request,
+      action: "deletion_request_rejected",
+      actor,
+      rejectReason: request.reject_reason,
+    });
+    await createDeletionNotification({
+      request,
+      cpId: request.requested_by_user_id,
+      message: "Request rejected - folder retained.",
+    });
+
+    return res.status(httpStatus.OK).json({ success: true, data: serializeDeletionRequest(request) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.requestFolderDeletion = async (req, res, next) => {
+  try {
+    const folderId = req.params.folderId;
+    const actor = normalizeActivityActor(req.body);
+    const folderDoc = isValidObjectId(folderId)
+      ? await FileMeta.findOne({ _id: folderId, isFolder: true }).lean()
+      : await FileMeta.findOne({ path: { $in: [normalizeWorkspacePath(folderId), `${normalizeWorkspacePath(folderId).replace(/\/+$/, "")}/`] }, isFolder: true }).lean();
+
+    if (!folderDoc) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Folder not found" });
+    if (!canActorAccessFolder(folderDoc, actor)) {
+      return res.status(httpStatus.FORBIDDEN).json({ success: false, message: "You do not have permission to delete this folder" });
+    }
+
+    const filePath = normalizeWorkspacePath(folderDoc.path);
+    if (isWithinCpDeleteWindow(folderDoc)) {
+      const result = await hardDeleteEntry({ filePath, actor });
+      return res.status(httpStatus.OK).json({ success: true, data: result });
+    }
+
+    const latestRequest = await FolderDeletionRequest.findOne({ folder_id: folderDoc._id }).sort({ requested_at: -1 });
+    if (!latestRequest || latestRequest.status === "completed") {
+      const snapshot = await getFolderSnapshot(filePath, folderDoc);
+      const request = await FolderDeletionRequest.create({
+        folder_id: folderDoc._id,
+        title: folderDoc.name,
+        requested_by_user_id: getActorObjectId(actor),
+        project_id: folderDoc.metadata?.orderId || null,
+        event_id: folderDoc.metadata?.eventId || folderDoc.metadata?.externalId || null,
+        reason: String(req.body.reason || "").trim() || "others",
+        description: String(req.body.description || "").trim() || "NA",
+        status: "pending",
+        file_count: snapshot.file_count,
+        total_size_bytes: snapshot.total_size_bytes,
+        requested_at: new Date(),
+      });
+      return res.status(httpStatus.CREATED).json({ success: true, data: serializeDeletionRequest(request) });
+    }
+
+    if (latestRequest.status === "pending") {
+      return res.status(httpStatus.OK).json({ success: true, already_requested: true, data: serializeDeletionRequest(latestRequest) });
+    }
+
+    if (latestRequest.status === "rejected") {
+      return res.status(httpStatus.FORBIDDEN).json({ success: false, message: "Your deletion request for this folder was rejected." });
+    }
+
+    const result = await hardDeleteEntry({ filePath, actor, approvedRequest: latestRequest });
+    return res.status(httpStatus.OK).json({ success: true, data: result });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.deleteEntry = async (req, res, next) => {
   try {
     const filePath = normalizeWorkspacePath(req.body.filepath || req.body.path || "");
@@ -3294,66 +3637,13 @@ exports.deleteEntry = async (req, res, next) => {
       path: { $in: [pathWithSlash, pathWithoutSlash] },
     }).lean();
 
-    const isFolderDelete = Boolean(folderDoc?.isFolder);
-    const effectivePath = isFolderDelete ? pathWithSlash : filePath;
-    const targetPath = effectivePath.startsWith("Website_Shoots_Flow/")
-      ? effectivePath
-      : `Website_Shoots_Flow/${effectivePath}`;
-
-    const escapedRoot = pathWithoutSlash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pathRegex = new RegExp(`^${escapedRoot}/`);
-    const extraDeleteFilter = {
-      $or: [
-        { path: pathWithSlash },
-        { path: pathWithoutSlash },
-        { path: pathRegex },
-      ],
-    };
-
-    const orderId = folderDoc?.metadata?.orderId;
-    if (orderId && isRootWorkspacePath(pathWithoutSlash)) {
-      extraDeleteFilter.$or.push({
-        isFolder: true,
-        parentFolderId: null,
-        path: { $regex: /^[^/]+\/?$/ },
-        "metadata.orderId": String(orderId),
-      });
+    if (folderDoc) {
+      req.params.folderId = folderDoc._id.toString();
+      return exports.requestFolderDeletion(req, res, next);
     }
 
-    const recordsToDelete = await FileMeta.find(extraDeleteFilter)
-      .select("path name size contentType isFolder")
-      .lean();
-    const deletedFiles = recordsToDelete.filter((record) => !record.isFolder);
-    const activityFiles = deletedFiles.length ? deletedFiles : recordsToDelete;
-
-    const result = await gcpFileService.deleteFile(targetPath);
-    const metadataCleanup = await FileMeta.deleteMany(extraDeleteFilter);
-    const embeddingCleanup = await FaceEmbedding.deleteMany({
-      $or: [{ filepath: pathWithoutSlash }, { filepath: pathWithSlash }, { filepath: pathRegex }],
-    });
-
-    await createFileActivityLog({
-      folderPath: isFolderDelete ? pathWithSlash : getParentPathFromWorkspacePath(filePath),
-      action: "delete",
-      actor,
-      files: activityFiles,
-      targetPath: filePath,
-      targetName: (isFolderDelete ? folderDoc?.name : filePath.split("/").pop()) || "",
-      targetIsFolder: isFolderDelete,
-      metadata: {
-        metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
-        embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
-      },
-    });
-
-    return res.status(httpStatus.OK).json({
-      success: true,
-      data: {
-        ...result,
-        metadataDeletedCount: Number(result?.deletedCount || 0) + Number(metadataCleanup.deletedCount || 0),
-        embeddingDeletedCount: embeddingCleanup.deletedCount || 0,
-      },
-    });
+    const result = await hardDeleteEntry({ filePath, actor });
+    return res.status(httpStatus.OK).json({ success: true, data: result });
   } catch (error) {
     return next(error);
   }
