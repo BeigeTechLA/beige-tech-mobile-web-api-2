@@ -763,6 +763,55 @@ const getWorkspaceFileCount = async (rootPath) =>
     path: { $regex: `^${escapeRegex(rootPath)}` },
   });
 
+// The workspace list used to run a file-count query and an activity query for
+// every root folder. Fetch those statistics for all returned roots at once.
+const getWorkspaceStatsByRootPath = async (rootPaths) => {
+  const uniqueRootPaths = [...new Set(
+    (rootPaths || [])
+      .map((path) => String(path || "").trim())
+      .filter(Boolean)
+  )];
+
+  if (!uniqueRootPaths.length) return new Map();
+
+  const rows = await FileMeta.aggregate([
+    {
+      $match: {
+        $or: uniqueRootPaths.map((rootPath) => ({
+          path: { $regex: `^${escapeRegex(rootPath)}` },
+        })),
+      },
+    },
+    {
+      $project: { path: 1, isFolder: 1, updatedAt: 1 },
+    },
+    {
+      $addFields: {
+        workspaceRoot: { $arrayElemAt: [{ $split: ["$path", "/"] }, 0] },
+      },
+    },
+    {
+      $group: {
+        _id: "$workspaceRoot",
+        fileCount: {
+          $sum: { $cond: [{ $eq: ["$isFolder", false] }, 1, 0] },
+        },
+        activityAt: { $max: "$updatedAt" },
+      },
+    },
+  ]);
+
+  return new Map(
+    rows.map((row) => [
+      `${String(row._id || "").replace(/\/+$/, "")}/`,
+      {
+        fileCount: Number(row.fileCount || 0),
+        activityAt: row.activityAt || null,
+      },
+    ])
+  );
+};
+
 const listWorkspaceImageCandidates = async (externalId) => {
   const workspace = await findWorkspaceRoot(externalId);
   if (!workspace) return [];
@@ -1406,18 +1455,18 @@ exports.listWorkspaces = async (req, res, next) => {
       path: { $regex: /^[^/]+\/?$/ },
       "metadata.orderId": { $exists: true, $ne: null },
     })
+      .select("path name fullPath metadata.orderId createdAt updatedAt")
       .sort({ updatedAt: -1 })
       .lean();
 
-    const workspaces = await Promise.all(
-      roots
-      .filter((root) => isRootWorkspacePath(root.path))
-      .map(async (root) => {
-        const fileCount = await getWorkspaceFileCount(root.path);
-        const activityAt = await getWorkspaceActivityAt(root.path, root.updatedAt);
-        return toWorkspaceSummary(root, fileCount, activityAt);
-      })
+    const workspaceRoots = roots.filter((root) => isRootWorkspacePath(root.path));
+    const workspaceStats = await getWorkspaceStatsByRootPath(
+      workspaceRoots.map((root) => root.path)
     );
+    const workspaces = workspaceRoots.map((root) => {
+      const stats = workspaceStats.get(`${String(root.path || "").replace(/\/+$/, "")}/`);
+      return toWorkspaceSummary(root, stats?.fileCount || 0, stats?.activityAt || root.updatedAt);
+    });
 
     return res.status(httpStatus.OK).json({
       success: true,
