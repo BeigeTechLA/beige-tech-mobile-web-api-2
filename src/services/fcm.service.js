@@ -4,7 +4,7 @@
  */
 
 const logger = require("../config/logger");
-const { FcmToken } = require("../models");
+const { FcmToken, FcmPreference } = require("../models");
 const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
 const { getFirebaseProjectForToken } = require("../config/firebase-http");
 const ApiError = require("../utils/ApiError");
@@ -33,12 +33,9 @@ const normalizeDeviceType = (value) => {
 
 const NOTIFICATION_TOPICS = new Set([
   'shoots',
-  'payments',
   'messages',
   'meetings',
-  'proposals',
   'files',
-  'system',
 ]);
 
 const DEFAULT_NOTIFICATION_PREFERENCES = {
@@ -46,9 +43,11 @@ const DEFAULT_NOTIFICATION_PREFERENCES = {
   topics: Object.fromEntries(Array.from(NOTIFICATION_TOPICS).map((topic) => [topic, true])),
 };
 
+logger.info("[FCM] Preference guard enabled: final Mongo re-check before Firebase send");
+
 const normalizeTopic = (value) => {
   const topic = normalizeString(value)?.toLowerCase();
-  return NOTIFICATION_TOPICS.has(topic) ? topic : 'system';
+  return NOTIFICATION_TOPICS.has(topic) ? topic : null;
 };
 
 const normalizeNotificationPreferences = (preferences = {}) => {
@@ -74,14 +73,154 @@ const normalizeNotificationPreferences = (preferences = {}) => {
   return normalized;
 };
 
-const isPushAllowedForToken = (tokenRecord, topic) => {
-  const preferences = tokenRecord.notification_preferences || {};
+const mergeWithDefaultPreferences = (preferences = {}) => {
+  const plainPreferences = preferences?.toObject ? preferences.toObject() : preferences || {};
+  const plainTopics = plainPreferences.topics?.toObject
+    ? plainPreferences.topics.toObject()
+    : plainPreferences.topics || {};
+
+  return {
+    ...DEFAULT_NOTIFICATION_PREFERENCES,
+    push_enabled: typeof plainPreferences.push_enabled === 'boolean'
+      ? plainPreferences.push_enabled
+      : DEFAULT_NOTIFICATION_PREFERENCES.push_enabled,
+    topics: {
+      ...DEFAULT_NOTIFICATION_PREFERENCES.topics,
+      ...plainTopics,
+    },
+  };
+};
+
+const saveSessionPreferences = async ({
+  userId,
+  sessionId,
+  notificationPreferences,
+}) => {
+  const normalizedUserId = normalizeString(userId);
+  const normalizedSessionId = normalizeString(sessionId);
+
+  if (!normalizedUserId || !normalizedSessionId) return null;
+  if (!notificationPreferences || !Object.keys(notificationPreferences).length) return null;
+
+  return FcmPreference.findOneAndUpdate(
+    {
+      user_id: normalizedUserId,
+      session_id: normalizedSessionId,
+    },
+    {
+      $set: {
+        notification_preferences: notificationPreferences,
+        is_active: true,
+        last_used_at: new Date(),
+      },
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+};
+
+const getSessionPreferences = async ({ userId, sessionId }) => {
+  const normalizedUserId = normalizeString(userId);
+  const normalizedSessionId = normalizeString(sessionId);
+
+  if (!normalizedUserId || !normalizedSessionId) return DEFAULT_NOTIFICATION_PREFERENCES;
+
+  const preferenceRecord = await FcmPreference.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  const tokenRecord = await FcmToken.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  const resolvedPreferences = mergePreferenceSources(
+    preferenceRecord?.notification_preferences,
+    tokenRecord?.notification_preferences
+  );
+
+  logger.info(`[FCM] Session preferences source ${JSON.stringify({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    source: preferenceRecord
+      ? (tokenRecord ? 'fcmpreferences+fcmtokens' : 'fcmpreferences')
+      : (tokenRecord ? 'fcmtokens' : 'default'),
+    fcmpreferences: preferenceRecord?.notification_preferences || null,
+    fcmtokens: tokenRecord?.notification_preferences || null,
+    resolved: resolvedPreferences,
+  })}`);
+
+  return resolvedPreferences;
+};
+
+const isPushAllowedForPreferences = (preferences, topic) => {
   if (preferences.push_enabled === false) return false;
+  if (!topic) return true;
 
   const topics = preferences.topics || {};
   if (topics[topic] === false) return false;
 
   return true;
+};
+
+const isTokenAllowedForTopic = async ({ tokenRecord, topic, userId }) => {
+  const normalizedUserId = normalizeString(userId || tokenRecord?.user_id);
+  const normalizedSessionId = normalizeString(tokenRecord?.session_id);
+
+  if (!normalizedUserId || !normalizedSessionId) {
+    return {
+      allowed: isPushAllowedForPreferences(DEFAULT_NOTIFICATION_PREFERENCES, topic),
+      preferences: DEFAULT_NOTIFICATION_PREFERENCES,
+      source: 'default',
+    };
+  }
+
+  const preferenceRecord = await FcmPreference.findOne({
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences');
+
+  const freshTokenRecord = await FcmToken.findOne({
+    _id: tokenRecord._id,
+    user_id: normalizedUserId,
+    session_id: normalizedSessionId,
+    is_active: true,
+  }).select('notification_preferences session_id app_user_type device_type');
+
+  const preferences = mergePreferenceSources(
+    preferenceRecord?.notification_preferences,
+    freshTokenRecord?.notification_preferences
+  );
+
+  return {
+    allowed: Boolean(freshTokenRecord) && isPushAllowedForPreferences(preferences, topic),
+    preferences,
+    source: preferenceRecord
+      ? (freshTokenRecord ? 'fcmpreferences+fcmtokens' : 'fcmpreferences')
+      : (freshTokenRecord ? 'fcmtokens' : 'default'),
+  };
+};
+
+const mergePreferenceSources = (...sources) => {
+  const merged = mergeWithDefaultPreferences(null);
+
+  for (const source of sources) {
+    if (!source) continue;
+
+    const preferences = mergeWithDefaultPreferences(source);
+    if (preferences.push_enabled === false) merged.push_enabled = false;
+
+    for (const topic of NOTIFICATION_TOPICS) {
+      if (preferences.topics?.[topic] === false) {
+        merged.topics[topic] = false;
+      }
+    }
+  }
+
+  return merged;
 };
 
 const saveFCMToken = async (userId, registrationToken, options = {}) => {
@@ -105,13 +244,22 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
       last_used_at: new Date(),
     };
 
-    if (Object.keys(notificationPreferences).length) {
+    const hasNotificationPreferences = Object.keys(notificationPreferences).length > 0;
+
+    if (hasNotificationPreferences) {
       payload.notification_preferences = notificationPreferences;
     }
 
     let tokensRecord = await FcmToken.findOne({ fcm_token: fcmToken });
 
     if (tokensRecord) {
+      const tokenChangedOwner = String(tokensRecord.user_id || '') !== normalizedUserId ||
+        String(tokensRecord.session_id || '') !== String(sessionId || '');
+
+      if (tokenChangedOwner && !hasNotificationPreferences) {
+        payload.notification_preferences = DEFAULT_NOTIFICATION_PREFERENCES;
+      }
+
       tokensRecord = await FcmToken.findByIdAndUpdate(
         tokensRecord._id,
         { $set: payload },
@@ -126,6 +274,14 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     if (sessionId && tokensRecord?._id) {
+      if (hasNotificationPreferences) {
+        await saveSessionPreferences({
+          userId: normalizedUserId,
+          sessionId,
+          notificationPreferences,
+        });
+      }
+
       await FcmToken.updateMany(
         {
           user_id: normalizedUserId,
@@ -194,7 +350,13 @@ const updateNotificationPreferences = async (userId, options = {}) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "notification_preferences is required");
     }
 
-    const updatedToken = await FcmToken.findOneAndUpdate(
+    const updatedPreference = await saveSessionPreferences({
+      userId: normalizedUserId,
+      sessionId,
+      notificationPreferences,
+    });
+
+    await FcmToken.updateMany(
       {
         user_id: normalizedUserId,
         session_id: sessionId,
@@ -205,16 +367,17 @@ const updateNotificationPreferences = async (userId, options = {}) => {
           notification_preferences: notificationPreferences,
           last_used_at: new Date(),
         },
-      },
-      { new: true }
+      }
     );
 
-    if (!updatedToken) {
-      throw new ApiError(httpStatus.NOT_FOUND, "Active FCM session not found");
-    }
-
-    logger.info(`FCM notification preferences updated for user ${normalizedUserId}`);
-    return updatedToken;
+    logger.info(`[FCM] Notification preferences updated ${JSON.stringify({
+      user_id: normalizedUserId,
+      session_id: sessionId,
+      push_enabled: notificationPreferences.push_enabled,
+      topics: notificationPreferences.topics || null,
+      preference_id: String(updatedPreference?._id || ''),
+    })}`);
+    return updatedPreference;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
     throw error;
@@ -230,24 +393,10 @@ const getNotificationPreferences = async (userId, options = {}) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and session_id are required");
     }
 
-    const tokenRecord = await FcmToken.findOne({
-      user_id: normalizedUserId,
-      session_id: sessionId,
-      is_active: true,
-    }).select('notification_preferences');
-
-    return {
-      ...DEFAULT_NOTIFICATION_PREFERENCES,
-      ...(tokenRecord?.notification_preferences?.toObject
-        ? tokenRecord.notification_preferences.toObject()
-        : tokenRecord?.notification_preferences || {}),
-      topics: {
-        ...DEFAULT_NOTIFICATION_PREFERENCES.topics,
-        ...(tokenRecord?.notification_preferences?.topics?.toObject
-          ? tokenRecord.notification_preferences.topics.toObject()
-          : tokenRecord?.notification_preferences?.topics || {}),
-      },
-    };
+    return getSessionPreferences({
+      userId: normalizedUserId,
+      sessionId,
+    });
   } catch (error) {
     logger.error("Error fetching FCM notification preferences:", error);
     throw error;
@@ -312,17 +461,46 @@ const logMessageDeliveryStatus = (response) => {
  * @throws {Error} If there's a critical error during the notification sending process, this function may throw an error.
  */
 const sendNotification = async (userId, title, content, customData) => {
+  /*
   return new Promise(async (resolve) => {
     try {
       const normalizedUserId = normalizeString(userId);
       const recipientTokenRecords = await getTokenRecordsByUserId(userId);
       const topic = normalizeTopic(customData?.topic || customData?.category || customData?.type);
-      const allowedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
-        isPushAllowedForToken(tokenRecord, topic)
-      ));
-      const blockedTokenRecords = recipientTokenRecords.filter((tokenRecord) => (
-        !isPushAllowedForToken(tokenRecord, topic)
-      ));
+      const tokenRecordsWithPreferences = await Promise.all(
+        recipientTokenRecords.map(async (tokenRecord) => ({
+          tokenRecord,
+          preferences: await getSessionPreferences({
+            userId: tokenRecord.user_id,
+            sessionId: tokenRecord.session_id,
+          }),
+        }))
+      );
+      const allowedTokenRecords = tokenRecordsWithPreferences
+        .filter(({ preferences }) => isPushAllowedForPreferences(preferences, topic))
+        .map(({ tokenRecord }) => tokenRecord);
+      const blockedTokenRecords = tokenRecordsWithPreferences
+        .filter(({ preferences }) => !isPushAllowedForPreferences(preferences, topic))
+        .map(({ tokenRecord }) => tokenRecord);
+
+      const preferenceDebug = {
+        user_id: normalizedUserId,
+        topic,
+        active_token_count: recipientTokenRecords.length,
+        allowed_token_count: allowedTokenRecords.length,
+        blocked_token_count: blockedTokenRecords.length,
+        tokens: tokenRecordsWithPreferences.map(({ tokenRecord, preferences }) => ({
+          token_id: String(tokenRecord._id || ''),
+          session_id: tokenRecord.session_id || null,
+          app_user_type: tokenRecord.app_user_type || null,
+          device_type: tokenRecord.device_type || null,
+          push_enabled: preferences.push_enabled,
+          topic_enabled: preferences.topics?.[topic],
+          allowed: isPushAllowedForPreferences(preferences, topic),
+        })),
+      };
+
+      logger.info(`[FCM] Preference evaluation ${JSON.stringify(preferenceDebug)}`);
 
       if (!allowedTokenRecords.length) {
         resolve({
@@ -344,6 +522,38 @@ const sendNotification = async (userId, title, content, customData) => {
       const sendResults = await Promise.all(
         allowedTokenRecords.map(async (tokenRecord) => {
           try {
+            const finalPreferenceCheck = await isTokenAllowedForTopic({
+              tokenRecord,
+              topic,
+              userId: normalizedUserId,
+            });
+
+            logger.info(`[FCM] Final send preference check ${JSON.stringify({
+              user_id: normalizedUserId,
+              token_id: String(tokenRecord._id || ''),
+              session_id: tokenRecord.session_id || null,
+              topic,
+              source: finalPreferenceCheck.source,
+              allowed: finalPreferenceCheck.allowed,
+              preferences: finalPreferenceCheck.preferences,
+            })}`);
+
+            if (!finalPreferenceCheck.allowed) {
+              return {
+                success: false,
+                tokenRecord,
+                blockedByPreferences: true,
+              };
+            }
+
+            logger.info(`[FCM] Sending Firebase push ${JSON.stringify({
+              user_id: normalizedUserId,
+              token_id: String(tokenRecord._id || ''),
+              session_id: tokenRecord.session_id || null,
+              topic,
+              type: customData?.type || null,
+            })}`);
+
             const firebaseProject = getFirebaseProjectForToken({
               appUserType: tokenRecord.app_user_type,
               deviceType: tokenRecord.device_type,
@@ -384,7 +594,8 @@ const sendNotification = async (userId, title, content, customData) => {
       }
 
       const successCount = sendResults.filter((result) => result.success).length;
-      const failureCount = sendResults.length - successCount;
+      const finalPreferenceBlockedCount = sendResults.filter((result) => result.blockedByPreferences).length;
+      const failureCount = sendResults.filter((result) => !result.success && !result.blockedByPreferences).length;
       logMessageDeliveryStatus({ successCount, failureCount });
 
       resolve({
@@ -395,6 +606,7 @@ const sendNotification = async (userId, title, content, customData) => {
           active_token_count: recipientTokenRecords.length,
           preference_allowed_token_count: allowedTokenRecords.length,
           preference_blocked_token_count: blockedTokenRecords.length,
+          final_preference_blocked_token_count: finalPreferenceBlockedCount,
           success_count: successCount,
           failure_count: failureCount,
           failures: sendResults
@@ -409,6 +621,7 @@ const sendNotification = async (userId, title, content, customData) => {
               error_code: result.error?.code || null,
               http_code: result.error?.httpCode || null,
               is_permanent_token_error: !!result.error?.isPermanentTokenError,
+              blocked_by_preferences: !!result.blockedByPreferences,
             })),
         },
       });
@@ -427,6 +640,20 @@ const sendNotification = async (userId, title, content, customData) => {
       });
     }
   });
+  */
+
+  logger.info(`[FCM] Notification trigger commented out ${JSON.stringify({
+    user_id: normalizeString(userId),
+    title,
+    topic: normalizeTopic(customData?.topic || customData?.category || customData?.type),
+    type: customData?.type || null,
+  })}`);
+
+  return {
+    success: false,
+    skipped: true,
+    reason: 'NOTIFICATION_TRIGGER_COMMENTED_OUT',
+  };
 };
 
 /**
