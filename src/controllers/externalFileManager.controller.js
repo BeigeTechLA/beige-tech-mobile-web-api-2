@@ -1232,7 +1232,9 @@ const runProviderFaceSearch = async ({
 
 const buildFolderDownloadUrl = (req, cleanPath) => {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
-  return `${baseUrl}/v1/gcp/download-folder?folderpath=${encodeURIComponent(cleanPath)}`;
+  const paths = Array.isArray(cleanPath) ? cleanPath : [cleanPath];
+  const query = paths.map((folderPath) => `folderpath=${encodeURIComponent(folderPath)}`).join("&");
+  return `${baseUrl}/v1/gcp/download-folder?${query}`;
 };
 
 exports.createWorkspace = async (req, res, next) => {
@@ -2881,14 +2883,21 @@ exports.getFolderDownloadUrl = async (req, res, next) => {
       });
     }
 
-    const basePath = resolveWorkspaceBasePath(workspace.path, phase, subPath);
-    const cleanPath = normalizeWorkspacePath(basePath);
+    const folders = Array.isArray(req.body.folders) ? req.body.folders : null;
+    if (folders && (!folders.length || folders.some((folder) => !String(folder?.path || "").trim()))) {
+      return res.status(httpStatus.BAD_REQUEST).json({ success: false, message: "Folder paths are required" });
+    }
+    const cleanPaths = folders
+      ? [...new Set(folders.map((folder) => normalizeWorkspacePath(
+        resolveWorkspaceBasePath(workspace.path, String(folder.phase || "root").trim().toLowerCase(), String(folder.path).trim())
+      )))]
+      : [normalizeWorkspacePath(resolveWorkspaceBasePath(workspace.path, phase, subPath))];
 
     return res.status(httpStatus.OK).json({
       success: true,
       data: {
-        url: buildFolderDownloadUrl(req, cleanPath),
-        filepath: cleanPath,
+        url: buildFolderDownloadUrl(req, cleanPaths),
+        filepath: cleanPaths[0],
       },
     });
   } catch (error) {

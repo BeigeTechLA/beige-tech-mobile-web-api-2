@@ -63,18 +63,30 @@ const getChatFiles = catchAsync(async (req, res, next) => {
 });
 
 const downloadFolder = catchAsync(async (req, res, next) => {
-  let folderPath = req.query.folderpath;
-  // Add Website_Shoots_Flow prefix if not present
-  folderPath = folderPath.startsWith("Website_Shoots_Flow/")
-    ? folderPath
-    : `Website_Shoots_Flow/${folderPath}`;
-  if (!folderPath) {
+  const rawPaths = Array.isArray(req.query.folderpath) ? req.query.folderpath : [req.query.folderpath];
+  const folderPaths = [...new Set(rawPaths.map((value) => {
+    const normalized = String(value || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!normalized) return "";
+    return `${normalized.startsWith("Website_Shoots_Flow/") ? normalized : `Website_Shoots_Flow/${normalized}`}/`;
+  }).filter(Boolean))];
+  if (!folderPaths.length) {
     return res.status(400).json({ error: "folderpath is required" });
   }
   try {
-    const [files] = await gcpFileService.bucket.getFiles({
-      prefix: folderPath,
-    });
+    const filesByName = new Map();
+    for (const prefix of folderPaths) {
+      const [folderFiles] = await gcpFileService.bucket.getFiles({ prefix });
+      folderFiles.forEach((file) => filesByName.set(file.name, file));
+    }
+    const files = [...filesByName.values()];
+    // Keep folder structure and duplicate filenames when combining owned folders.
+    const commonParts = folderPaths[0].split("/").filter(Boolean);
+    if (folderPaths.length > 1) {
+      while (commonParts.length && !folderPaths.every((prefix) => prefix.startsWith(`${commonParts.join("/")}/`))) {
+        commonParts.pop();
+      }
+    }
+    const folderPath = `${commonParts.join("/")}/`;
 
     if (files.length === 0) {
       return res.status(404).json({ error: "folder not found or is empty" });
