@@ -17,6 +17,7 @@ module.exports.FaceScanIndexJob = require("./faceScanIndexJob.model");
 module.exports.FcmToken = require("./fcmToken.model");
 module.exports.FcmPreference = require("./fcmPreference.model");
 module.exports.FirebaseHttpAccessToken = require("./firebaseHttpAccessToken.model");
+module.exports.PushDeliveryLog = require('./pushDeliveryLog.model');
 module.exports.Rating = require("./rating.model");
 module.exports.AlgoSetting = require("./settings/algo.model");
 module.exports.Settings = require("./settings/setting.model");

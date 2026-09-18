@@ -11,5 +11,7 @@ router.delete('/tokens', internalPushController.removeToken);
 router.get('/preferences', internalPushController.getPreferences);
 router.patch('/preferences', internalPushController.updatePreferences);
 router.post('/send', internalPushController.sendNotification);
+router.get('/debug/logs', internalPushController.getDebugLogs);
+router.get('/debug/view', internalPushController.viewDebugLogs);
 
 module.exports = router;

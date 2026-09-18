@@ -7,6 +7,7 @@ const logger = require("../config/logger");
 const { FcmToken, FcmPreference } = require("../models");
 const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
 const { getFirebaseProjectForToken } = require("../config/firebase-http");
+const pushDeliveryLogService = require('./push-delivery-log.service');
 const ApiError = require("../utils/ApiError");
 const httpStatus = require("http-status");
 // Removed to fix circular dependency
@@ -460,7 +461,7 @@ const logMessageDeliveryStatus = (response) => {
  *                            or `false` if there's an error during the notification sending process.
  * @throws {Error} If there's a critical error during the notification sending process, this function may throw an error.
  */
-const sendNotification = async (userId, title, content, customData) => {
+const sendNotification = async (userId, title, content, customData, options = {}) => {
   /*
   return new Promise(async (resolve) => {
     try {
@@ -642,7 +643,22 @@ const sendNotification = async (userId, title, content, customData) => {
   });
   */
 
+  const traceId = await pushDeliveryLogService.createTrace({
+    traceId: options.traceId,
+    userId,
+    title,
+    data: customData,
+  });
+
+  await pushDeliveryLogService.addEvent(traceId, {
+    step: 'notification_send_skipped',
+    status: 'blocked',
+    message: 'Firebase sending is currently disabled because the notification trigger is commented out.',
+  });
+  await pushDeliveryLogService.updateStatus(traceId, 'skipped');
+
   logger.info(`[FCM] Notification trigger commented out ${JSON.stringify({
+    trace_id: traceId,
     user_id: normalizeString(userId),
     title,
     topic: normalizeTopic(customData?.topic || customData?.category || customData?.type),
@@ -653,6 +669,7 @@ const sendNotification = async (userId, title, content, customData) => {
     success: false,
     skipped: true,
     reason: 'NOTIFICATION_TRIGGER_COMMENTED_OUT',
+    trace_id: traceId,
   };
 };
 
