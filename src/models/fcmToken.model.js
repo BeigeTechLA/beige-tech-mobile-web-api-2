@@ -31,6 +31,10 @@ const tokenSchema = mongoose.Schema(
             trim: true,
             default: null,
         },
+        recipient_ids: {
+            type: [String],
+            default: [],
+        },
         notification_preferences: {
             push_enabled: {
                 type: Boolean,
@@ -80,6 +84,7 @@ tokenSchema.index(
     }
 );
 tokenSchema.index({ user_id: 1, is_active: 1 });
+tokenSchema.index({ recipient_ids: 1, is_active: 1 });
 tokenSchema.index({ user_id: 1, session_id: 1 });
 
 /**

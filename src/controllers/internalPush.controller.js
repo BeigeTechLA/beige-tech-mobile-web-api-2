@@ -7,6 +7,7 @@ const saveToken = catchAsync(async (req, res) => {
     session_id: req.body.session_id,
     device_type: req.body.device_type,
     app_user_type: req.body.app_user_type,
+    recipient_ids: req.body.recipient_ids,
     notification_preferences: req.body.notification_preferences,
   });
 

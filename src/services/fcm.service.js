@@ -26,6 +26,11 @@ const normalizeString = (value) => {
   return text || null;
 };
 
+const normalizeRecipientIds = (values, canonicalUserId) => {
+  const source = Array.isArray(values) ? values : [];
+  return [...new Set(source.map(normalizeString).filter(Boolean).filter((id) => id !== canonicalUserId))];
+};
+
 const normalizeDeviceType = (value) => {
   const deviceType = normalizeString(value)?.toLowerCase();
   return ['android', 'ios', 'web'].includes(deviceType) ? deviceType : 'android';
@@ -229,6 +234,7 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     const fcmToken = normalizeString(registrationToken || options.fcm_token);
     const sessionId = normalizeString(options.session_id);
     const notificationPreferences = normalizeNotificationPreferences(options.notification_preferences || {});
+    const recipientIds = normalizeRecipientIds(options.recipient_ids, normalizedUserId);
 
     if (!normalizedUserId || !fcmToken) {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken are required");
@@ -240,6 +246,7 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
       session_id: sessionId,
       device_type: normalizeDeviceType(options.device_type),
       app_user_type: normalizeString(options.app_user_type),
+      recipient_ids: recipientIds,
       is_active: true,
       last_used_at: new Date(),
     };
@@ -416,8 +423,11 @@ const getTokenRecordsByUserId = async (userId) => {
     if (!normalizedUserId) return [];
 
     return FcmToken.find({
-      user_id: normalizedUserId,
       is_active: true,
+      $or: [
+        { user_id: normalizedUserId },
+        { recipient_ids: normalizedUserId },
+      ],
     }).select('fcm_token session_id app_user_type device_type notification_preferences');
   } catch (error) {
     logger.error(`Error fetching FCM tokens for user ${userId}: ${error}`);
