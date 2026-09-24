@@ -61,6 +61,17 @@ const buildFcmHttpV1Payload = ({ token, title, body, data = {} }) => {
   };
 
   if (message.notification) {
+    message.webpush = {
+      headers: {
+        Urgency: 'high',
+      },
+      notification: {
+        title: normalizedTitle,
+        body: normalizedBody,
+        icon: '/icon.png',
+      },
+    };
+
     message.apns = {
       headers: {
         'apns-push-type': 'alert',
