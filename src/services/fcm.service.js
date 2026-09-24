@@ -534,7 +534,7 @@ const sendNotification = async (userId, title, content, customData) => {
             const finalPreferenceCheck = await isTokenAllowedForTopic({
               tokenRecord,
               topic,
-              userId: normalizedUserId,
+              userId: tokenRecord.user_id,
             });
 
             logger.info(`[FCM] Final send preference check ${JSON.stringify({
