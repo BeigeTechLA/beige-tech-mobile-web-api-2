@@ -978,7 +978,8 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
     await chatRoom.save();
 
     // Send push notifications and socket notifications to all participants
-    const notificationTitle = "New message";
+    const roomName = String(chatRoom.name || (chatRoom.chat_id ? `Chat #${chatRoom.chat_id}` : "")).trim().slice(0, 80);
+    const notificationTitle = roomName ? `New message in ${roomName}` : "New chat message";
     const notificationContent = `${senderName}: ${messagePreview.substring(0, 50)}${messagePreview.length > 50 ? '...' : ''}`;
 
     // Separate participants by role for database notification
@@ -1051,13 +1052,9 @@ async function notifyAllParticipants(roomId, senderId, senderName, messagePrevie
         notificationContent,
         {
           topic: "messages",
-          category: "messages",
           type: "newMessage",
-          senderId: senderId,
-          receiverId: participantId,
-          roomId: roomId,
-          id: roomId,
-          messageId: messageId,
+          roomId: String(roomId),
+          messageId: String(messageId),
         }
       );
 

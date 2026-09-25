@@ -7,6 +7,7 @@ const logger = require("../config/logger");
 const { FcmToken, FcmPreference } = require("../models");
 const { sendFcmHttpV1Message } = require("../helpers/firebase-http.helper");
 const { getFirebaseProjectForToken } = require("../config/firebase-http");
+const { writePushNotificationLog } = require("../utils/pushNotificationLog");
 const ApiError = require("../utils/ApiError");
 const httpStatus = require("http-status");
 // Removed to fix circular dependency
@@ -252,12 +253,32 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     };
 
     const hasNotificationPreferences = Object.keys(notificationPreferences).length > 0;
-
-    if (hasNotificationPreferences) {
-      payload.notification_preferences = notificationPreferences;
-    }
-
+    const registrationDisablesPush = notificationPreferences.push_enabled === false ||
+      Object.values(notificationPreferences.topics || {}).some((enabled) => enabled === false);
+    const existingSessionPreferences = sessionId
+      ? await FcmPreference.findOne({ user_id: normalizedUserId, session_id: sessionId, is_active: true })
+      : null;
+    const existingSessionToken = sessionId
+      ? await FcmToken.findOne({ user_id: normalizedUserId, session_id: sessionId, is_active: true })
+      : null;
     let tokensRecord = await FcmToken.findOne({ fcm_token: fcmToken });
+    const sameTokenOwner = tokensRecord &&
+      String(tokensRecord.user_id || "") === normalizedUserId &&
+      String(tokensRecord.session_id || "") === String(sessionId || "");
+    const shouldApplyRegistrationPreferences = hasNotificationPreferences &&
+      (registrationDisablesPush || (!existingSessionPreferences && !existingSessionToken && !sameTokenOwner));
+    const registrationPreferences = registrationDisablesPush
+      ? mergePreferenceSources(
+        existingSessionPreferences?.notification_preferences,
+        existingSessionToken?.notification_preferences,
+        sameTokenOwner ? tokensRecord.notification_preferences : null,
+        notificationPreferences
+      )
+      : notificationPreferences;
+
+    if (shouldApplyRegistrationPreferences) {
+      payload.notification_preferences = registrationPreferences;
+    }
 
     if (tokensRecord) {
       const tokenChangedOwner = String(tokensRecord.user_id || '') !== normalizedUserId ||
@@ -281,11 +302,11 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     if (sessionId && tokensRecord?._id) {
-      if (hasNotificationPreferences) {
+      if (shouldApplyRegistrationPreferences) {
         await saveSessionPreferences({
           userId: normalizedUserId,
           sessionId,
-          notificationPreferences,
+          notificationPreferences: registrationPreferences,
         });
       }
 
@@ -306,9 +327,22 @@ const saveFCMToken = async (userId, registrationToken, options = {}) => {
     }
 
     logger.info(`FCM token saved for user ${normalizedUserId}`);
+    await writePushNotificationLog({
+      event: "token_registered",
+      user_id: normalizedUserId,
+      token_id: String(tokensRecord?._id || ""),
+      device_type: payload.device_type,
+      app_user_type: payload.app_user_type,
+      recipient_ids: recipientIds,
+    });
     return tokensRecord;
   } catch (error) {
     logger.error("Error saving FCM token:", error);
+    await writePushNotificationLog({
+      event: "token_registration_failed",
+      user_id: normalizeString(userId),
+      error_code: error.code || null,
+    });
     throw error;
   }
 };
@@ -323,7 +357,7 @@ const removeFCMToken = async (userId, registrationToken, options = {}) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "userId and registrationToken or session_id are required");
     }
 
-    await FcmToken.updateOne(
+    const removalResult = await FcmToken.updateOne(
       sessionId
         ? { user_id: normalizedUserId, session_id: sessionId }
         : { user_id: normalizedUserId, fcm_token: fcmToken },
@@ -336,9 +370,20 @@ const removeFCMToken = async (userId, registrationToken, options = {}) => {
     );
 
     logger.info(`FCM token removed for user ${normalizedUserId}`);
+    await writePushNotificationLog({
+      event: "token_removed",
+      user_id: normalizedUserId,
+      session_id: sessionId,
+      modified_count: removalResult.modifiedCount || 0,
+    });
     return true;
   } catch (error) {
     logger.error("Error removing FCM token:", error);
+    await writePushNotificationLog({
+      event: "token_removal_failed",
+      user_id: normalizeString(userId),
+      error_code: error.code || null,
+    });
     throw error;
   }
 };
@@ -384,9 +429,21 @@ const updateNotificationPreferences = async (userId, options = {}) => {
       topics: notificationPreferences.topics || null,
       preference_id: String(updatedPreference?._id || ''),
     })}`);
+    await writePushNotificationLog({
+      event: "preferences_updated",
+      user_id: normalizedUserId,
+      session_id: sessionId,
+      push_enabled: notificationPreferences.push_enabled,
+      topics: notificationPreferences.topics || null,
+    });
     return updatedPreference;
   } catch (error) {
     logger.error("Error updating FCM notification preferences:", error);
+    await writePushNotificationLog({
+      event: "preferences_update_failed",
+      user_id: normalizeString(userId),
+      error_code: error.code || null,
+    });
     throw error;
   }
 };
@@ -512,6 +569,22 @@ const sendNotification = async (userId, title, content, customData) => {
       logger.info(`[FCM] Preference evaluation ${JSON.stringify(preferenceDebug)}`);
 
       if (!allowedTokenRecords.length) {
+        await writePushNotificationLog({
+          event: "delivery_summary",
+          recipient_id: normalizedUserId,
+          topic: topic || normalizeString(customData?.topic || customData?.category || customData?.type),
+          type: normalizeString(customData?.type),
+          room_id: normalizeString(customData?.roomId),
+          message_id: normalizeString(customData?.messageId),
+          active_token_count: recipientTokenRecords.length,
+          allowed_token_count: 0,
+          blocked_token_count: blockedTokenRecords.length,
+          success_count: 0,
+          failure_count: 0,
+          reason: recipientTokenRecords.length
+            ? "PUSH_DISABLED_BY_SESSION_PREFERENCES"
+            : "NO_ACTIVE_FCM_TOKENS_FOR_USER",
+        });
         resolve({
           success: false,
           debug: {
@@ -607,6 +680,30 @@ const sendNotification = async (userId, title, content, customData) => {
       const failureCount = sendResults.filter((result) => !result.success && !result.blockedByPreferences).length;
       logMessageDeliveryStatus({ successCount, failureCount });
 
+      await writePushNotificationLog({
+        event: "delivery_summary",
+        recipient_id: normalizedUserId,
+        topic: topic || normalizeString(customData?.topic || customData?.category || customData?.type),
+        type: normalizeString(customData?.type),
+        room_id: normalizeString(customData?.roomId),
+        message_id: normalizeString(customData?.messageId),
+        active_token_count: recipientTokenRecords.length,
+        allowed_token_count: allowedTokenRecords.length,
+        blocked_token_count: blockedTokenRecords.length + finalPreferenceBlockedCount,
+        success_count: successCount,
+        failure_count: failureCount,
+        devices: sendResults.map((result) => ({
+          token_id: String(result.tokenRecord?._id || ""),
+          token_user_id: normalizeString(result.tokenRecord?.user_id),
+          device_type: normalizeString(result.tokenRecord?.device_type),
+          app_user_type: normalizeString(result.tokenRecord?.app_user_type),
+          status: result.success ? "sent" : result.blockedByPreferences ? "blocked" : "failed",
+          firebase_error_code: result.error?.firebaseErrorCode || null,
+          error_code: result.error?.code || null,
+          http_code: result.error?.httpCode || null,
+        })),
+      });
+
       resolve({
         success: successCount > 0,
         debug: {
@@ -638,6 +735,18 @@ const sendNotification = async (userId, title, content, customData) => {
     } catch (error) {
       // Handle any errors that occur during the notification sending process
       logger.error("Error sending notifications:", error);
+      await writePushNotificationLog({
+        event: "delivery_summary",
+        recipient_id: normalizeString(userId),
+        topic: normalizeTopic(customData?.topic || customData?.category || customData?.type)
+          || normalizeString(customData?.topic || customData?.category || customData?.type),
+        type: normalizeString(customData?.type),
+        room_id: normalizeString(customData?.roomId),
+        message_id: normalizeString(customData?.messageId),
+        success_count: 0,
+        reason: "SEND_NOTIFICATION_EXCEPTION",
+        error_code: error.code || null,
+      });
       resolve({
         success: false,
         debug: {
