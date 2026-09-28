@@ -400,6 +400,63 @@ const softDeleteMessage = async (messageId, deletedBy, options = {}) => {
 };
 
 /**
+ * Batch soft delete. One find + one updateMany for any number of messages.
+ * Same rules as softDeleteMessage: skips already-deleted and system messages,
+ * and non-admins can only delete their own. Skipped ids are returned, not thrown.
+ */
+const softDeleteMessages = async (chatRoomId, messageIds = [], deletedBy, options = {}) => {
+  try {
+    const roomId = String(chatRoomId || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(roomId)) {
+      throw new ApiError(httpStatus.BAD_REQUEST, "Invalid chat room id");
+    }
+
+    const requestedIds = [...new Set((messageIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+    const validIds = requestedIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+
+    const deletedById = normalizeActorId(deletedBy);
+    const allowAnySender = Boolean(options.allowAnySender);
+
+    if (!allowAnySender && !deletedById) {
+      throw new ApiError(httpStatus.FORBIDDEN, "You can only delete your own messages");
+    }
+
+    const candidates = validIds.length
+      ? await ChatMessage.find({
+          _id: { $in: validIds },
+          chat_room_id: roomId,
+          is_deleted: { $ne: true },
+          message_type: { $ne: "system" },
+        })
+          .select("_id sent_by")
+          .lean()
+      : [];
+
+    const allowedIds = candidates
+      .filter((message) => allowAnySender || normalizeActorId(message.sent_by) === deletedById)
+      .map((message) => String(message._id));
+
+    const now = new Date();
+    if (allowedIds.length) {
+      await ChatMessage.updateMany(
+        { _id: { $in: allowedIds } },
+        { $set: { is_deleted: true, deleted_at: now, deleted_by: deletedById || deletedBy } }
+      );
+    }
+
+    const allowedSet = new Set(allowedIds);
+    return {
+      deletedIds: allowedIds,
+      skippedIds: requestedIds.filter((id) => !allowedSet.has(id)),
+      updatedAt: now.toISOString(),
+    };
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, error.message);
+  }
+};
+
+/**
  * Add a reaction to a message
  */
 const addReaction = async (messageId, emoji, userId, userName) => {
@@ -510,6 +567,7 @@ module.exports = {
   deleteChatMessage,
   editMessage,
   softDeleteMessage,
+  softDeleteMessages,
   addReaction,
   sendReplyMessage,
   getMessageById,

@@ -667,6 +667,10 @@ const updateChatStatusByOrderStatus = async (orderId, orderStatus) => {
       messageType = 'shoot_completed';
     }
 
+    if (chatRoom.status === 'archived' && newChatStatus === 'read_only') {
+      return null;
+    }
+
     if (newChatStatus && chatRoom.status !== newChatStatus) {
       const oldStatus = chatRoom.status;
       chatRoom.status = newChatStatus;
