@@ -474,18 +474,20 @@ const getNotificationPreferences = async (userId, options = {}) => {
  * @param {string} userId - The ID of the user for whom to fetch FCM tokens.
  * @returns {Array<string> | false} An array of FCM tokens for the user, or false if no tokens are found.
  */
-const getTokenRecordsByUserId = async (userId) => {
+const getTokenRecordsByUserId = async (userId, { canonicalOnly = false } = {}) => {
   try {
     const normalizedUserId = normalizeString(userId);
     if (!normalizedUserId) return [];
 
     return FcmToken.find({
       is_active: true,
-      $or: [
-        { user_id: normalizedUserId },
-        { recipient_ids: normalizedUserId },
-      ],
-    }).select('fcm_token session_id app_user_type device_type notification_preferences');
+      ...(canonicalOnly
+        ? { user_id: normalizedUserId }
+        : { $or: [
+          { user_id: normalizedUserId },
+          { recipient_ids: normalizedUserId },
+        ] }),
+    }).select('user_id fcm_token session_id app_user_type device_type notification_preferences');
   } catch (error) {
     logger.error(`Error fetching FCM tokens for user ${userId}: ${error}`);
     return [];
@@ -531,8 +533,8 @@ const sendNotification = async (userId, title, content, customData) => {
   return new Promise(async (resolve) => {
     try {
       const normalizedUserId = normalizeString(userId);
-      const recipientTokenRecords = await getTokenRecordsByUserId(userId);
       const topic = normalizeTopic(customData?.topic || customData?.category || customData?.type);
+      const recipientTokenRecords = await getTokenRecordsByUserId(userId, { canonicalOnly: topic === 'meetings' });
       const tokenRecordsWithPreferences = await Promise.all(
         recipientTokenRecords.map(async (tokenRecord) => ({
           tokenRecord,

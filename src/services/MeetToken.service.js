@@ -9,6 +9,7 @@ const orderService = require("./order.service");
 const { format, parseISO } = require("date-fns");
 
 const getStoredMeetToken = () => MeetToken.findOne({}).sort({ _id: -1 });
+const isMongoObjectId = (value) => /^[a-f\d]{24}$/i.test(String(value || ""));
 /**
  * Create meet token or handle OAuth2 callback
  * @param {Object} data Data needed for creating a meet token
@@ -46,7 +47,7 @@ const generateMeetLink = async (data) => {
 
     // Build attendees list - add the meeting creator if userId is provided
     const attendees = [];
-    if (userId) {
+    if (isMongoObjectId(userId)) {
       try {
         const creator = await User.findById(userId);
         if (creator && creator.email) {
@@ -115,8 +116,8 @@ const generateMeetLink = async (data) => {
               htmlLink: event.data.htmlLink,
             });
 
-            // Only attempt to send emails if orderId is provided
-            if (data?.orderId) {
+            // MySQL web booking IDs are not MongoDB Order IDs.
+            if (isMongoObjectId(data?.orderId)) {
               try {
                 // Find the order and check if it exists
                 const order = await Order.findById(data.orderId).populate({
