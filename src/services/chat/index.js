@@ -29,6 +29,7 @@ module.exports = {
   deleteChatMessage: chatMessageService.deleteChatMessage,
   editMessage: chatMessageService.editMessage,
   softDeleteMessage: chatMessageService.softDeleteMessage,
+  softDeleteMessages: chatMessageService.softDeleteMessages,
   addReaction: chatMessageService.addReaction,
   sendReplyMessage: chatMessageService.sendReplyMessage,
   getMessageById: chatMessageService.getMessageById,

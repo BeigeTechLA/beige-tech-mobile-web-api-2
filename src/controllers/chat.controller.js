@@ -76,6 +76,14 @@ const getChatRooms = catchAsync(async (req, res) => {
     filter.production_ids = { $elemMatch: { id: requestQuery.production_id } };
   }
 
+  const requestedStatus = String(requestQuery.status || "").trim().toLowerCase();
+  if (requestedStatus === "archived") {
+    filter.status = "archived";
+  } else if (requestedStatus) {
+    // "active" view: everything except archived (read_only stays visible)
+    filter.status = { $ne: "archived" };
+  }
+
   const options = pick(requestQuery, ["sortBy", "limit", "page", "populate"]);
 
   if (requestQuery.search) {

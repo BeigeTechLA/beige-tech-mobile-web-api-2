@@ -154,6 +154,20 @@ const emitExternalChatMessageDeleted = ({ roomId, updatedMessage, messageId }) =
   });
 };
 
+const emitExternalChatMessagesDeleted = ({ roomId, messageIds, updatedAt }) => {
+  const io = getIO();
+  const ids = Array.isArray(messageIds) ? messageIds.map(String).filter(Boolean) : [];
+  if (!io || !roomId || !ids.length) return;
+
+  io.to(String(roomId)).emit("messagesDeleted", {
+    success: true,
+    roomId: String(roomId),
+    messageIds: ids,
+    updatedAt: updatedAt || new Date().toISOString(),
+    is_deleted: true,
+  });
+};
+
 const emitExternalChatReactionUpdated = ({ roomId, updatedMessage }) => {
   const io = getIO();
   if (!io || !roomId || !updatedMessage) return;
@@ -165,6 +179,26 @@ const emitExternalChatReactionUpdated = ({ roomId, updatedMessage }) => {
     messageId,
     reactions: Array.isArray(updatedMessage.reactions) ? updatedMessage.reactions : [],
     updatedAt: updatedMessage.updatedAt || new Date().toISOString(),
+  });
+};
+
+const emitExternalChatRoomStatusChanged = ({ chatRoom, status }) => {
+  const io = getIO();
+  const room = getPlainRoom(chatRoom);
+  const roomId = normalizeParticipantId(room);
+  if (!io || !roomId) return;
+
+  const payload = {
+    success: true,
+    roomId,
+    chatRoomId: roomId,
+    status,
+    updatedAt: new Date().toISOString(),
+  };
+
+  io.to(roomId).emit("chatRoomStatusChanged", payload);
+  getRoomParticipantIds(room).forEach((userId) => {
+    io.to(`user_${userId}`).emit("chatRoomStatusChanged", payload);
   });
 };
 
@@ -391,6 +425,53 @@ const deleteMessageHandler = async (req, res) => {
   }
 };
 
+const batchDeleteMessagesHandler = async (req, res) => {
+  try {
+    const roomId = String(req.params.roomId || "").trim();
+    const deleterId = req.body.sender?.id || req.body.userId;
+    const messageIds = Array.isArray(req.body.messageIds)
+      ? [...new Set(req.body.messageIds.map((id) => String(id || "").trim()).filter(Boolean))]
+      : [];
+
+    if (!roomId) {
+      return res.status(400).send({ success: false, message: "Room id is required" });
+    }
+    if (!deleterId) {
+      return res.status(400).send({ success: false, message: "User id is required" });
+    }
+    if (!messageIds.length) {
+      return res.status(400).send({ success: false, message: "messageIds are required" });
+    }
+    if (messageIds.length > 100) {
+      return res.status(400).send({ success: false, message: "You can delete at most 100 messages at once" });
+    }
+
+    const result = await chatService.softDeleteMessages(roomId, messageIds, String(deleterId), {
+      allowAnySender: Boolean(req.body.allowAnySender),
+    });
+
+    emitExternalChatMessagesDeleted({
+      roomId,
+      messageIds: result.deletedIds,
+      updatedAt: result.updatedAt,
+    });
+
+    return res.status(200).send({
+      success: true,
+      data: {
+        deletedIds: result.deletedIds,
+        skippedIds: result.skippedIds,
+        updatedAt: result.updatedAt,
+      },
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).send({
+      success: false,
+      message: error.message || "Failed to delete messages",
+    });
+  }
+};
+
 const reactionHandler = async (req, res) => {
   try {
     const emoji = String(req.body.emoji || "").trim();
@@ -436,8 +517,42 @@ router.patch("/messages/:messageId/edit", editMessageHandler);
 router.post("/messages/:messageId/edit", editMessageHandler);
 router.patch("/messages/:messageId/delete", deleteMessageHandler);
 router.post("/messages/:messageId/delete", deleteMessageHandler);
+router.post("/room/:roomId/messages/batch-delete", batchDeleteMessagesHandler);
 router.post("/messages/:messageId/reaction", reactionHandler);
 router.get("/participants/:roomId", chatController.getChatParticipants);
+router.patch("/rooms/:roomId/status", async (req, res) => {
+  try {
+    const status = String(req.body.status || "").trim().toLowerCase();
+    if (!["active", "read_only", "archived"].includes(status)) {
+      return res.status(400).send({
+        success: false,
+        message: "Valid status is required (active, read_only, archived)",
+      });
+    }
+
+    const adminId = req.body.adminUser?.id || req.body.adminId || "beige-admin";
+    const adminName = req.body.adminUser?.name || req.body.sender?.name || "Beige Admin";
+
+    const chatRoom = await chatService.updateChatRoomStatus(
+      String(req.params.roomId),
+      status,
+      String(adminId),
+      adminName
+    );
+
+    emitExternalChatRoomStatusChanged({ chatRoom, status });
+
+    return res.status(200).send({
+      success: true,
+      data: getPlainRoom(chatRoom),
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).send({
+      success: false,
+      message: error.message || "Failed to update chat status",
+    });
+  }
+});
 router.patch("/rooms/:roomId/mark-read", async (req, res) => {
   try {
     const userId = String(req.body.userId || req.body.sender?.id || "").trim();
