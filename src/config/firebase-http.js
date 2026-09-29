@@ -10,28 +10,61 @@ const normalizeString = (value) => {
   return text || null;
 };
 
-const normalizeProject = (project = {}) => ({
-  key: normalizeString(project.key || project.project_key) || DEFAULT_PROJECT_KEY,
-  env: normalizeString(project.env || project.environment || DEFAULT_FIREBASE_PROJECT_ENV)?.toLowerCase(),
-  appUserType: normalizeString(project.app_user_type || project.appUserType),
-  deviceTypes: Array.isArray(project.device_types || project.deviceTypes)
-    ? (project.device_types || project.deviceTypes).map((item) => normalizeString(item)?.toLowerCase()).filter(Boolean)
-    : [],
-  projectId: normalizeString(project.project_id || project.projectId),
-  clientEmail: normalizeString(project.client_email || project.clientEmail),
-  privateKey: normalizePrivateKey(project.private_key || project.privateKey),
-});
+const getServiceAccountFromFile = (filePath) => {
+  const normalizedPath = normalizeString(filePath);
+  if (!normalizedPath) return {};
+
+  try {
+    // This supports development-only, gitignored service-account files. Production
+    // deployments should continue to provide credentials through environment secrets.
+    return require(require('path').resolve(normalizedPath));
+  } catch (error) {
+    console.error(`Unable to load Firebase service-account file ${normalizedPath}: ${error.message}`);
+    return {};
+  }
+};
+
+const normalizeProject = (project = {}) => {
+  const serviceAccount = getServiceAccountFromFile(project.service_account_file || project.serviceAccountFile);
+
+  return {
+    key: normalizeString(project.key || project.project_key) || DEFAULT_PROJECT_KEY,
+    env: normalizeString(project.env || project.environment || DEFAULT_FIREBASE_PROJECT_ENV)?.toLowerCase(),
+    appUserType: normalizeString(project.app_user_type || project.appUserType),
+    deviceTypes: Array.isArray(project.device_types || project.deviceTypes)
+      ? (project.device_types || project.deviceTypes).map((item) => normalizeString(item)?.toLowerCase()).filter(Boolean)
+      : [],
+    projectId: normalizeString(project.project_id || project.projectId || serviceAccount.project_id),
+    clientEmail: normalizeString(project.client_email || project.clientEmail || serviceAccount.client_email),
+    privateKey: normalizePrivateKey(project.private_key || project.privateKey || serviceAccount.private_key),
+  };
+};
+
+const parseProjectList = (rawValue, variableName) => {
+  if (!rawValue) return [];
+
+  try {
+    const parsedProjects = JSON.parse(rawValue);
+    if (!Array.isArray(parsedProjects)) {
+      console.error(`${variableName} must be a JSON array.`);
+      return [];
+    }
+    return parsedProjects.map(normalizeProject);
+  } catch (error) {
+    console.error(`Invalid ${variableName}: ${error.message}`);
+    return [];
+  }
+};
 
 const parseFirebaseProjects = () => {
-  if (process.env.FIREBASE_PROJECTS_JSON) {
-    try {
-      const parsedProjects = JSON.parse(process.env.FIREBASE_PROJECTS_JSON);
-      if (Array.isArray(parsedProjects) && parsedProjects.length) {
-        return parsedProjects.map(normalizeProject);
-      }
-    } catch (error) {
-      console.error(`Invalid FIREBASE_PROJECTS_JSON: ${error.message}`);
-    }
+  const primaryProjects = parseProjectList(process.env.FIREBASE_PROJECTS_JSON, 'FIREBASE_PROJECTS_JSON');
+  const additionalProjects = parseProjectList(
+    process.env.FIREBASE_ADDITIONAL_PROJECTS_JSON,
+    'FIREBASE_ADDITIONAL_PROJECTS_JSON'
+  );
+
+  if (primaryProjects.length || additionalProjects.length) {
+    return [...primaryProjects, ...additionalProjects];
   }
 
   return [
