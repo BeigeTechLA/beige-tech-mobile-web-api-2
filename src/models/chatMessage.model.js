@@ -186,6 +186,7 @@ const chatMessageSchema = new mongoose.Schema({
 
 chatMessageSchema.plugin(toJSON);
 chatMessageSchema.plugin(paginate);
+chatMessageSchema.index({ createdAt: -1, chat_room_id: 1 });
 
 const ChatMessageModel = mongoose.model("ChatMessage", chatMessageSchema);
 
