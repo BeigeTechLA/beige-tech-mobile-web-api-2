@@ -219,6 +219,14 @@ const requireInternalKey = (req, res, next) => {
 router.use(requireInternalKey);
 
 router.get("/rooms", chatController.getChatRooms);
+router.get("/digest-candidates", async (req, res) => {
+  try {
+    const candidates = await chatService.getEmailDigestCandidates(req.query.since);
+    return res.status(200).send({ results: candidates });
+  } catch (error) {
+    return res.status(error.statusCode || 500).send({ success: false, message: error.message || 'Failed to load chat email digest candidates' });
+  }
+});
 router.post("/room", async (req, res) => {
   try {
     const chatRoom = await chatService.createChatRoom(req.body, req.body.adminUser || req.body.adminId || null);

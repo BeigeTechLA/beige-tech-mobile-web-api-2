@@ -33,6 +33,7 @@ module.exports = {
   addReaction: chatMessageService.addReaction,
   sendReplyMessage: chatMessageService.sendReplyMessage,
   getMessageById: chatMessageService.getMessageById,
+  getEmailDigestCandidates: chatMessageService.getEmailDigestCandidates,
 
   // Chat Participant operations
   addParticipants: chatParticipantService.addParticipants,

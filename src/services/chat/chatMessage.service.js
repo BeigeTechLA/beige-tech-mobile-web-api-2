@@ -559,6 +559,35 @@ const getMessageById = async (messageId) => {
   }
 };
 
+// Returns one latest user-generated message per room for the email digest.
+// The main API calls this once per digest window instead of polling every room.
+const getEmailDigestCandidates = async (since) => {
+  const sinceDate = new Date(since);
+  if (Number.isNaN(sinceDate.getTime())) {
+    throw new ApiError(httpStatus.BAD_REQUEST, 'A valid since timestamp is required');
+  }
+
+  return ChatMessage.aggregate([
+    { $match: { createdAt: { $gt: sinceDate }, message_type: { $ne: 'system' }, is_deleted: { $ne: true } } },
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: '$chat_room_id', latest_message: { $first: '$$ROOT' } } },
+    {
+      $project: {
+        _id: 0,
+        room_id: { $toString: '$_id' },
+        latest_message: {
+          _id: { $toString: '$latest_message._id' },
+          message: '$latest_message.message',
+          file_name: '$latest_message.file_name',
+          sent_by_name: '$latest_message.sent_by_name',
+          sent_by_email: '$latest_message.sent_by_email',
+          createdAt: '$latest_message.createdAt',
+        },
+      },
+    },
+  ]);
+};
+
 module.exports = {
   getChatsByRoomId,
   getChatFilesByRoomId,
@@ -571,4 +600,5 @@ module.exports = {
   addReaction,
   sendReplyMessage,
   getMessageById,
+  getEmailDigestCandidates,
 };
