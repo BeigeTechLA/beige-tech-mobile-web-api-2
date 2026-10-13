@@ -4,7 +4,10 @@ const { getValidStoredAccessToken } = require('./firebase-auth.helper');
 const { buildFcmHttpV1Payload } = require('./notification-payload.helper');
 
 const FCM_SEND_URL = (projectId) => `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-const PERMANENT_TOKEN_ERROR_CODES = new Set(['UNREGISTERED', 'INVALID_ARGUMENT']);
+// A token issued by another Firebase sender cannot be delivered with this
+// project's credentials. Treat it like other unusable tokens so repeated
+// notifications do not keep retrying the same stale browser registration.
+const PERMANENT_TOKEN_ERROR_CODES = new Set(['UNREGISTERED', 'INVALID_ARGUMENT', 'SENDER_ID_MISMATCH']);
 
 const extractFirebaseErrorCode = (errorData = {}) => {
   const details = Array.isArray(errorData.error?.details) ? errorData.error.details : [];
