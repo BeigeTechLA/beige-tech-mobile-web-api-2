@@ -58,13 +58,8 @@ const parseProjectList = (rawValue, variableName) => {
 
 const parseFirebaseProjects = () => {
   const primaryProjects = parseProjectList(process.env.FIREBASE_PROJECTS_JSON, 'FIREBASE_PROJECTS_JSON');
-  const additionalProjects = parseProjectList(
-    process.env.FIREBASE_ADDITIONAL_PROJECTS_JSON,
-    'FIREBASE_ADDITIONAL_PROJECTS_JSON'
-  );
-
-  if (primaryProjects.length || additionalProjects.length) {
-    return [...primaryProjects, ...additionalProjects];
+  if (primaryProjects.length) {
+    return primaryProjects;
   }
 
   return [
