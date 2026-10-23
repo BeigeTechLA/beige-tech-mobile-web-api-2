@@ -32,6 +32,7 @@ router.post("/upload-policies/batch", externalFileManagerController.getUploadPol
 router.post("/file-uploaded", externalFileManagerController.completeUpload);
 router.post("/files-uploaded/batch", externalFileManagerController.completeUploadsBatch);
 router.post("/copy-files", externalFileManagerController.copyFiles);
+router.post("/move-entries", externalFileManagerController.moveEntries);
 router.post("/revision-file/review", externalFileManagerController.reviewRevisionFile);
 router.get("/face-scan/queue-status", externalFileManagerController.getFaceScanQueueStatus);
 router.post("/face-scan/jobs", externalFileManagerController.createFaceScanJob);
