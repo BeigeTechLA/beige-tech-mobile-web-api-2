@@ -318,7 +318,7 @@ const deleteChatMessage = async (chatMessageId) => {
  * @param {string} editedBy - User ID of editor
  * @param {Object} encryptedContent - Optional E2E encrypted content
  */
-const editMessage = async (messageId, newContent, editedBy, encryptedContent = null) => {
+const editMessage = async (messageId, newContent, editedBy, encryptedContent = null, mentions = undefined) => {
   try {
     const message = await ChatMessage.findById(messageId);
     if (!message) {
@@ -334,6 +334,18 @@ const editMessage = async (messageId, newContent, editedBy, encryptedContent = n
     }
 
     message.message = newContent;
+    // Keep mention metadata in sync when an edit removes an @name from the text.
+    // New mentions arrive from the edit route after room membership validation.
+    if (Array.isArray(mentions)) {
+      message.mentions = mentions;
+    } else if (Array.isArray(message.mentions) && message.mentions.length) {
+      message.mentions = message.mentions.filter((mention) => {
+        const name = String(mention?.name || "").trim();
+        if (!name) return false;
+        const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`@${escapedName}(?![\\p{L}\\p{N}_])`, "u").test(newContent);
+      });
+    }
     message.is_edited = true;
     message.edited_at = new Date();
     message.edited_by = editedBy;

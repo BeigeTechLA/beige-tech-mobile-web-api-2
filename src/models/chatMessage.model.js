@@ -86,6 +86,14 @@ const chatMessageSchema = new mongoose.Schema({
             target_role: String
         },
 
+        // Users @mentioned in this message (validated against room participants)
+        mentions: [{
+            _id: false,
+            user_id: { type: mongoose.Schema.Types.Mixed, required: true },
+            name: { type: String, required: false },
+            email: { type: String, required: false }
+        }],
+
         // Reply to another message
         reply_to: {
             type: mongoose.SchemaTypes.ObjectId,

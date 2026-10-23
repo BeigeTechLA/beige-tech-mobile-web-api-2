@@ -13,7 +13,10 @@ const getPlainRoom = (room) => {
 };
 
 const normalizeParticipantId = (value) => {
-  const id = String(value?.id || value?._id || value || "").trim();
+  const rawId = value && typeof value === "object"
+    ? (value.id || value._id || value.user_id || value.userId || value.client_id || value.clientId || value.crew_member_id || value.crewMemberId)
+    : value;
+  const id = String(rawId || "").trim();
   return id || null;
 };
 
@@ -58,6 +61,93 @@ const getRoomParticipantIds = (room) => {
   });
 
   return [...participantIds];
+};
+
+// Keeps only mentions that match a real participant of the room (by id or email).
+// Self-mentions and duplicates are dropped. Client-supplied names are never trusted for identity.
+const resolveRoomMentions = (room, rawMentions, senderId, senderEmail) => {
+  if (!Array.isArray(rawMentions) || !rawMentions.length) return [];
+
+  const plainRoom = getPlainRoom(room) || {};
+  const roomParticipants = [
+    plainRoom.client_id,
+    plainRoom.client_snapshot,
+    plainRoom.pm_id,
+    ...(Array.isArray(plainRoom.client_ids) ? plainRoom.client_ids : []),
+    ...(Array.isArray(plainRoom.cp_ids) ? plainRoom.cp_ids : []),
+    ...(Array.isArray(plainRoom.manager_ids) ? plainRoom.manager_ids : []),
+    ...(Array.isArray(plainRoom.production_ids) ? plainRoom.production_ids : []),
+  ].filter(Boolean);
+
+  const self = new Set(
+    [senderId, senderEmail].map((v) => String(v || "").trim().toLowerCase()).filter(Boolean)
+  );
+  const seen = new Set();
+  const result = [];
+
+  rawMentions.forEach((item) => {
+    const requestedId = String(
+      item?.id ?? item?.user_id ?? (typeof item === "object" ? "" : item) ?? ""
+    ).trim();
+    const requestedIdKey = requestedId.toLowerCase();
+    const requestedAliases = (Array.isArray(item?.aliases) ? item.aliases : [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean);
+    const requestedEmail = String(item?.email || "").trim().toLowerCase();
+    if (!requestedIdKey && !requestedEmail) return;
+
+    // Resolve client supplied identifiers back to a room participant. Never persist
+    // an arbitrary id or display name supplied by the message sender.
+    // Emails identify the selected person across legacy ID namespaces. Then
+    // match the canonical participant ID. Alias IDs are only a last resort
+    // when no email was supplied; client_id/crew_member_id can collide with
+    // another user's platform ID.
+    const participantByEmail = requestedEmail
+      ? roomParticipants.find((candidate) => {
+        const email = typeof candidate === "object" ? candidate?.email : candidate;
+        return String(email || "").trim().toLowerCase() === requestedEmail;
+      })
+      : null;
+    const participantByCanonicalId = requestedIdKey
+      ? roomParticipants.find((candidate) => normalizeParticipantId(candidate)?.toLowerCase() === requestedIdKey)
+      : null;
+    const participantByAlias = !requestedEmail && requestedAliases.length
+      ? roomParticipants.find((candidate) => {
+          const participantIds = getParticipantNotificationIds(candidate).map((v) => v.toLowerCase());
+          return requestedAliases.some((id) => participantIds.includes(id));
+      })
+      : null;
+    const participant = participantByEmail || participantByCanonicalId || participantByAlias;
+    if (!participant) return;
+
+    // The upstream API validates the email and sends the canonical participant
+    // ID. Keep that ID when an older room snapshot has a different legacy ID.
+    const id = participantByEmail && requestedId ? requestedId : normalizeParticipantId(participant);
+    const idKey = String(id || "").toLowerCase();
+    const email = String(participant?.email || (typeof participant === "string" && participant.includes("@") ? participant : "")).trim().toLowerCase();
+    const identityKey = email ? `email:${email}` : `id:${idKey}`;
+    if (!id || self.has(idKey) || (email && self.has(email)) || seen.has(identityKey)) return;
+    seen.add(identityKey);
+    result.push({
+      user_id: id,
+      name: String(participant?.name || item?.name || "").trim().slice(0, 120) || email || id,
+      email: email || null,
+    });
+  });
+
+  return result;
+};
+
+const mentionsPresentInText = (mentions, text) => {
+  const message = String(text || "");
+  const includesAllMention = /(^|\s)@(?:all|everyone)(?![\p{L}\p{N}_])/iu.test(message);
+  return (Array.isArray(mentions) ? mentions : []).filter((mention) => {
+    if (includesAllMention) return true;
+    const name = String(mention?.name || "").trim();
+    if (!name) return false;
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`@${escapedName}(?![\\p{L}\\p{N}_])`, "u").test(message);
+  });
 };
 
 const emitExternalChatRoomCreated = ({ chatRoom, createdBy }) => {
@@ -115,6 +205,7 @@ const emitExternalChatMessage = ({ roomId, savedMessage, senderId, senderName })
     createdAt,
     updatedAt: savedMessage.updatedAt || createdAt,
     replyTo: savedMessage.reply_to || null,
+    mentions: Array.isArray(savedMessage.mentions) ? savedMessage.mentions : [],
     success: true,
   });
 
@@ -135,6 +226,7 @@ const emitExternalChatMessageEdited = ({ roomId, updatedMessage }) => {
     roomId: String(roomId),
     messageId,
     content: updatedMessage.message || "",
+    mentions: Array.isArray(updatedMessage.mentions) ? updatedMessage.mentions : [],
     updatedAt: updatedMessage.updatedAt || new Date().toISOString(),
     is_edited: true,
   });
@@ -323,6 +415,10 @@ router.post("/messages/:roomId", async (req, res) => {
     const senderId = sender.id ? String(sender.id) : null;
     const senderName = sender.name || sender.email || "Beige User";
     const replyTo = req.body.replyTo ? String(req.body.replyTo) : null;
+    const mentions = mentionsPresentInText(
+      resolveRoomMentions(room, req.body.mentions, senderId, sender.email),
+      message
+    );
     const payload = {
       chat_room_id: req.params.roomId,
       message,
@@ -332,6 +428,7 @@ router.post("/messages/:roomId", async (req, res) => {
       message_type: "text",
       status: "Sent",
       ...(replyTo ? { reply_to: replyTo } : {}),
+      ...(mentions.length ? { mentions } : {}),
     };
     const saved = replyTo ? await chatService.sendReplyMessage(payload) : await chatService.saveChatRoomMessage(payload);
 
@@ -383,7 +480,24 @@ const editMessageHandler = async (req, res) => {
       });
     }
 
-    const updated = await chatService.editMessage(req.params.messageId, content, String(editorId));
+    const previous = await chatService.getMessageById(req.params.messageId);
+    const sender = req.body.sender || {};
+    const room = await chatService.getChatRoomById(String(previous?.chat_room_id || req.body.roomId || ""));
+    const mentions = Array.isArray(req.body.mentions)
+      ? mentionsPresentInText(
+        resolveRoomMentions(room, req.body.mentions, String(editorId), sender.email),
+        content
+      )
+      : undefined;
+    const mentionIdentity = (mention) => {
+      const email = String(mention?.email || "").trim().toLowerCase();
+      return email ? `email:${email}` : `id:${String(mention?.user_id || "")}`;
+    };
+    const previousMentionIdentities = new Set((previous?.mentions || []).map(mentionIdentity));
+    const newlyMentionedUsers = (mentions || [])
+      .filter((mention) => !previousMentionIdentities.has(mentionIdentity(mention)))
+      .map((mention) => ({ id: String(mention.user_id), email: mention.email || null }));
+    const updated = await chatService.editMessage(req.params.messageId, content, String(editorId), null, mentions);
     const roomId = String(
       updated?.chat_room_id || updated?.chatRoomId || req.body.roomId || req.body.chat_room_id || ""
     );
@@ -391,6 +505,7 @@ const editMessageHandler = async (req, res) => {
     return res.status(200).send({
       success: true,
       data: updated,
+      newlyMentionedUsers,
     });
   } catch (error) {
     return res.status(error.statusCode || 500).send({
