@@ -23,12 +23,15 @@ const getAddOnById = catchAsync(async (req, res) => {
   res.json(result);
 });
 
+
+
 // update addOns by id
 const updateAddOnsById = catchAsync(async (req, res) => {
   const addOnId = req.params.addOnId;
   const result = await addOnsService.updateAddOnsById(addOnId, req.body);
   res.json(result);
 });
+
 // delete addOns by id
 
 const deleteAddOnById = catchAsync(async (req, res) => {
@@ -50,3 +53,7 @@ module.exports = {
   getAddOnById,
   getAllAddOnCategories,
 };
+
+
+
+// Get all unique addon categories
