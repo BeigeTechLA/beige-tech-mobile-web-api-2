@@ -2758,6 +2758,7 @@ exports.moveEntries = async (req, res, next) => {
     const externalId = normalizeExternalId(req.body.externalId);
     const phase = String(req.body.phase || "").trim().toLowerCase();
     const targetPath = String(req.body.targetPath || "").trim().replace(/^\/+|\/+$/g, "");
+    const cursor = normalizeWorkspacePath(req.body.cursor || "");
     const sourcePaths = Array.isArray(req.body.sourcePaths) ? req.body.sourcePaths : [];
     if (!externalId || !["pre", "post"].includes(phase) || !sourcePaths.length || sourcePaths.length > 250 ||
       [targetPath, ...sourcePaths].some((value) => typeof value !== "string" || value.split("/").some((part) => part === "." || part === ".."))) {
@@ -2774,20 +2775,29 @@ exports.moveEntries = async (req, res, next) => {
     if (!destinationDoc) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Destination folder not found" });
 
     const expandedPaths = [];
-    let movingPhaseContents = false;
+    let movingSystemFolderFiles = false;
     for (const rawPath of sourcePaths) {
       const requestedPath = normalizeWorkspacePath(rawPath).replace(/\/+$/, "");
-      const phaseRoot = await FileMeta.findOne({ path: { $in: [requestedPath, `${requestedPath}/`] }, isFolder: true });
-      if (phaseRoot && [ `${root}/Pre-Production`, `${root}/Post-Production` ].includes(requestedPath)) {
-        movingPhaseContents = true;
+      const systemFolder = await FileMeta.findOne({ path: { $in: [requestedPath, `${requestedPath}/`] }, isFolder: true });
+      const isWorkflowFolderPath = new RegExp(`^${escapeRegex(root)}/(?:Pre-Production|Post-Production/(?:Raw Footage|Edits|Edited Footage|Final Deliverables))$`, "i").test(requestedPath);
+      if (systemFolder && (isWorkflowFolderPath || [
+        "preproduction",
+        "postproduction_raw_footage",
+        "postproduction_edited_footage",
+        "postproduction_final_deliverables",
+      ].includes(systemFolder.folderType))) {
+        movingSystemFolderFiles = true;
         const directEntries = await listWorkspaceContents(`${requestedPath}/`);
-        expandedPaths.push(...directEntries.folders.map((entry) => entry.path), ...directEntries.files.map((entry) => entry.path));
+        expandedPaths.push(...directEntries.files.map((entry) => entry.path));
       } else {
         expandedPaths.push(rawPath);
       }
     }
-    const hasMore = movingPhaseContents && expandedPaths.length > 50;
-    const batchPaths = movingPhaseContents ? expandedPaths.slice(0, 50) : expandedPaths;
+    const remainingPaths = movingSystemFolderFiles
+      ? [...new Set(expandedPaths)].sort().filter((entry) => entry > cursor)
+      : expandedPaths;
+    const hasMore = movingSystemFolderFiles && remainingPaths.length > 50;
+    const batchPaths = movingSystemFolderFiles ? remainingPaths.slice(0, 50) : remainingPaths;
     const results = [];
     for (const rawPath of new Set(batchPaths)) {
       const sourcePath = normalizeWorkspacePath(rawPath).replace(/\/+$/, "");
@@ -2874,7 +2884,9 @@ exports.moveEntries = async (req, res, next) => {
     }
     return res.status(httpStatus.OK).json({ success: true, data: {
       total: results.length, successCount: results.filter((item) => item.success).length,
-      failureCount: results.filter((item) => !item.success).length, hasMore, items: results,
+      failureCount: results.filter((item) => !item.success).length, hasMore,
+      nextCursor: movingSystemFolderFiles ? batchPaths[batchPaths.length - 1] || null : null,
+      items: results,
     } });
   } catch (error) { return next(error); }
 };
