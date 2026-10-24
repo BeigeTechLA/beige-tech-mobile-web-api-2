@@ -2,6 +2,7 @@ const httpStatus = require("http-status");
 const mongoose = require("mongoose");
 const { FileMeta, FileActivityLog, FaceEmbedding, FaceScanJob, Order, Booking } = require("../models");
 const gcpFileService = require("../services/gcpFile.service");
+const fileManagerWorkflowService = require("../services/fileManagerWorkflow.service");
 const faceScanQueueService = require("../services/faceScanQueue.service");
 const { ensurePostProductionFolder } = gcpFileService;
 const sendgridService = require("../services/sendgrid.service");
@@ -534,6 +535,35 @@ const canonicalizeWorkflowPath = (value) => {
       return segment;
     })
     .join("/");
+};
+
+const runWorkflowHook = async (label, task) => {
+  try { await task(); } catch (error) { console.error(`File manager workflow hook (${label}) failed:`, error.message); }
+};
+
+const handleWorkflowUpload = async ({ orderId, path, userId, authorName }) => runWorkflowHook("upload", async () => {
+  const normalizedPath = normalizeWorkspacePath(path);
+  if (!orderId || !/\/Post-Production\/Edits\/(Edited Deliverables|Revisions\/Version\d+)\//i.test(normalizedPath)) return;
+  const workflow = await fileManagerWorkflowService.getOrCreateWorkflow(orderId);
+  const root = await fileManagerWorkflowService.rootFor(orderId);
+  const uploadedFile = await FileMeta.findOne({ path: normalizedPath, isFolder: false });
+  if (root && uploadedFile && !uploadedFile.metadata?.copiedFrom && !uploadedFile.metadata?.originalPath) {
+    const selectedPath = `${normalizeWorkspacePath(root.path).replace(/\/$/, "")}/Post-Production/Edits/Selected for Edits/`;
+    const selectedFile = await FileMeta.findOne({ isFolder: false, path: { $regex: `^${escapeRegex(selectedPath)}` }, name: uploadedFile.name }).lean();
+    if (selectedFile) {
+      const originalPath = selectedFile.metadata?.copiedFrom || selectedFile.metadata?.originalPath || selectedFile.path;
+      await FileMeta.updateOne({ _id: uploadedFile._id }, { $set: { "metadata.copiedFrom": originalPath, "metadata.originalPath": originalPath } });
+    }
+  }
+  const version = Number(normalizedPath.match(/\/Revisions\/Version(\d+)\//i)?.[1] || 0);
+  await fileManagerWorkflowService.recordActivity(orderId, version ? "revision_uploaded" : "send_for_edits", { by: userId, byName: authorName, version: version || null, status: workflow.status });
+  if (!version && workflow.status === "not_started") await fileManagerWorkflowService.transition(orderId, "in_progress", { by: userId, byName: authorName, note: "Editing Started Automatically" });
+});
+
+const buildActivityDisplayText = (log = {}) => {
+  const count = Number(log.fileCount || 0); const version = log.metadata?.version ? ` (version ${log.metadata.version})` : "";
+  const labels = { upload: `${count} file${count === 1 ? "" : "s"} uploaded`, delete: `${count} file${count === 1 ? "" : "s"} deleted`, send_for_edits: "Files sent for edits", client_selection_received: "Client selection received", start_editing: "Editing started", submit_approval: "Submitted for approval", request_revision: `Revision requested${version}`, revision_downloaded: `Revision downloaded${version}`, revision_uploaded: `Revision uploaded${version}`, submit_revision: `Revision submitted${version}`, approve: "Approved", complete: "Completed" };
+  return labels[log.action] || log.action;
 };
 
 const toMongoUserIdOrNull = (value) => {
@@ -1629,7 +1659,7 @@ exports.getFolderActivityLogs = async (req, res, next) => {
     } else {
       query.rootPath = rootPath.endsWith("/") ? rootPath : `${rootPath}/`;
     }
-    if (["upload", "delete"].includes(action)) {
+    if (FileActivityLog.schema.path("action").enumValues.includes(action)) {
       query.action = action;
     }
 
@@ -1678,7 +1708,7 @@ exports.getFolderActivityLogs = async (req, res, next) => {
     return res.status(httpStatus.OK).json({
       success: true,
       data: {
-        logs,
+        logs: logs.map((log) => ({ ...log, displayText: buildActivityDisplayText(log) })),
         summary: {
           uploads: mapSummary(uploadSummary),
           deletes: mapSummary(deleteSummary),
@@ -1989,6 +2019,8 @@ const completeUploadMetadataForFile = async ({
       );
     }
 
+    await handleWorkflowUpload({ orderId: folderMetadata.orderId, path: existingFile.path, userId: normalizedUserId, authorName: cleanAuthorName });
+
     return {
       ok: true,
       created: false,
@@ -2052,6 +2084,8 @@ const completeUploadMetadataForFile = async ({
       normalizeActivityActor({ userId: normalizedUserId, authorName: cleanAuthorName })
     );
   }
+
+  await handleWorkflowUpload({ orderId: folderMetadata.orderId, path: fileDoc.path, userId: normalizedUserId, authorName: cleanAuthorName });
 
   return {
     ok: true,
@@ -2311,6 +2345,12 @@ exports.completeUploadsBatch = async (req, res, next) => {
           userEmail: req.body.userEmail,
         })
       );
+      await Promise.all(uploadedItems.map((item) => handleWorkflowUpload({
+        orderId: req.body.externalId || req.body.orderId,
+        path: item.path,
+        userId: req.body.userId,
+        authorName: req.body.authorName,
+      })));
     }
 
     return res.status(httpStatus.OK).json({
@@ -2632,7 +2672,16 @@ exports.copyFiles = async (req, res, next) => {
     const destinationFolder = normalizeWorkspacePath(
       resolveWorkspaceBasePath(workspace.path, phase, targetPath)
     ).replace(/\/$/, "");
-    const { parentFolder: destinationFolderDoc } = await getParentFolderMetadata(`${destinationFolder}/__copy_target__`);
+    let { parentFolder: destinationFolderDoc } = await getParentFolderMetadata(`${destinationFolder}/__copy_target__`);
+
+    if (!destinationFolderDoc && /\/Post-Production\/Edits\/Selected for Edits$/i.test(destinationFolder)) {
+      await gcpFileService.ensureEditsSubfolder({
+        workspaceRoot,
+        orderId: externalId,
+        folderName: "Selected for Edits",
+      });
+      ({ parentFolder: destinationFolderDoc } = await getParentFolderMetadata(`${destinationFolder}/__copy_target__`));
+    }
 
     if (!destinationFolderDoc) {
       return res.status(httpStatus.NOT_FOUND).json({
@@ -2738,6 +2787,20 @@ exports.copyFiles = async (req, res, next) => {
       }
     });
 
+    if (destinationFolder.includes("/Selected for Edits")) {
+      await runWorkflowHook("selection-copy", async () => {
+        const workflow = await fileManagerWorkflowService.getOrCreateWorkflow(externalId);
+        const clientReference = req.body.clientReference;
+        const fileCount = results.filter((item) => item.success).length;
+        if (clientReference && typeof clientReference === "object") {
+          workflow.clientReference = { link: String(clientReference.link || "").trim(), message: String(clientReference.message || "").trim(), receivedAt: new Date(), receivedBy: normalizedUserId };
+          await workflow.save();
+          await fileManagerWorkflowService.recordActivity(externalId, "client_selection_received", { by: normalizedUserId, byName: authorName, note: workflow.clientReference.message, fileCount, status: workflow.status });
+        }
+        await fileManagerWorkflowService.recordActivity(externalId, "send_for_edits", { by: normalizedUserId, byName: authorName, fileCount, status: workflow.status });
+      });
+    }
+
     return res.status(httpStatus.OK).json({
       success: true,
       data: {
@@ -2802,6 +2865,10 @@ exports.reviewRevisionFile = async (req, res, next) => {
     const action = String(req.body.action || "").trim().toLowerCase();
     const normalizedUserId = req.body.userId ? String(req.body.userId).trim() : null;
     const authorName = String(req.body.authorName || "Beige User").trim();
+    const workflowActorId = normalizedUserId || (req.body.by ? String(req.body.by).trim() : null);
+    const workflowActorName = req.body.authorName
+      ? authorName
+      : (req.body.byName ? String(req.body.byName).trim() : null);
 
     if (!externalId || !filePath || !["approve", "request_revision"].includes(action)) {
       return res.status(httpStatus.BAD_REQUEST).json({
@@ -2881,6 +2948,13 @@ exports.reviewRevisionFile = async (req, res, next) => {
       sourceDoc.updatedAt = touchedAt;
       await sourceDoc.save();
 
+      await runWorkflowHook("review-approve", async () => {
+        const workflow = await fileManagerWorkflowService.getOrCreateWorkflow(externalId);
+        if (["submitted", "resubmitted"].includes(workflow.status) && !(await fileManagerWorkflowService.hasPendingReview(externalId))) {
+          await fileManagerWorkflowService.transition(externalId, "approved", { by: workflowActorId, byName: workflowActorName, note: "All files approved" });
+        }
+      });
+
       return res.status(httpStatus.OK).json({
         success: true,
         data: {
@@ -2897,7 +2971,15 @@ exports.reviewRevisionFile = async (req, res, next) => {
 
     const nextVersionNumber = versionNumber + 1;
     const revisionsPath = `${workspaceRoot}/Post-Production/Edits/Revisions`;
-    const { parentFolder: revisionsFolder } = await getParentFolderMetadata(`${revisionsPath}/__revision_target__`);
+    let { parentFolder: revisionsFolder } = await getParentFolderMetadata(`${revisionsPath}/__revision_target__`);
+    if (!revisionsFolder) {
+      await gcpFileService.ensureEditsSubfolder({
+        workspaceRoot,
+        orderId: externalId,
+        folderName: "Revisions",
+      });
+      ({ parentFolder: revisionsFolder } = await getParentFolderMetadata(`${revisionsPath}/__revision_target__`));
+    }
     if (!revisionsFolder) {
       return res.status(httpStatus.NOT_FOUND).json({
         success: false,
@@ -2924,6 +3006,13 @@ exports.reviewRevisionFile = async (req, res, next) => {
     };
     sourceDoc.updatedAt = touchedAt;
     await sourceDoc.save();
+
+    await runWorkflowHook("review-revision-request", async () => {
+      const workflow = await fileManagerWorkflowService.getOrCreateWorkflow(externalId);
+      if (["submitted", "resubmitted"].includes(workflow.status)) {
+        await fileManagerWorkflowService.transition(externalId, "revision_requested", { by: workflowActorId, byName: workflowActorName, note: "Revision requested during review" });
+      }
+    });
 
     return res.status(httpStatus.OK).json({
       success: true,

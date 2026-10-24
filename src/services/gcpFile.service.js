@@ -77,7 +77,7 @@ const POST_PRODUCTION_SUBFOLDERS = [
   {
     name: 'Edits',
     folderType: 'postproduction_edited_footage',
-    children: ['Selected for Edits', 'Revisions']
+    children: ['Selected for Edits', 'Edited Deliverables', 'Revisions']
   },
   {
     name: 'Final Deliverables',
@@ -495,6 +495,24 @@ const createPostProductionSubfoldersOnly = async (parentPath, parentFolderId, cp
 };
 
 const createPostProductionSubfolders = createPostProductionSubfoldersOnly;
+
+// Additive migration-on-read for workspaces created before Edits subfolders existed.
+const ensureEditsSubfolder = async ({ workspaceRoot, orderId, folderName }) => {
+  const root = String(workspaceRoot || "").replace(/^\/+|\/+$/g, "");
+  const normalizedFolderName = String(folderName || "").trim();
+  if (!root || !normalizedFolderName) return null;
+  const postProductionPath = `${root}/Post-Production/`;
+  let postProduction = await FileMeta.findOne({ path: postProductionPath, isFolder: true });
+  if (!postProduction) return null;
+  let edits = await FileMeta.findOne({ path: `${root}/Post-Production/Edits/`, isFolder: true });
+  if (!edits) {
+    edits = await ensurePostProductionFolder({ parentPath: postProduction.path, parentFolderId: postProduction._id, folderName: "Edits", folderType: "postproduction_edited_footage", cpIds: postProduction.metadata?.cpIds || [], orderId: orderId || postProduction.metadata?.orderId, userId: postProduction.userId });
+  }
+  return ensurePostProductionFolder({ parentPath: edits.path, parentFolderId: edits._id, folderName: normalizedFolderName, folderType: "postproduction_edited_footage", cpIds: edits.metadata?.cpIds || [], orderId: orderId || edits.metadata?.orderId, userId: edits.userId });
+};
+
+const ensureEditedDeliverablesFolder = ({ workspaceRoot, orderId }) =>
+  ensureEditsSubfolder({ workspaceRoot, orderId, folderName: "Edited Deliverables" });
 
 /**
  * Create production workflow subfolders (Pre-Production, Post-Production with subfolders)
@@ -1984,7 +2002,6 @@ const getRecentFiles = async (userId = null) => {
                   const folderCreatedBy = JSON.parse(
                     folderMetadata.metadata.createdBy
                   );
-                  // If it's a string but not an array, convert to array
                   if (Array.isArray(folderCreatedBy)) {
                     createdByUserIds = folderCreatedBy;
                   } else if (typeof folderCreatedBy === "string") {
@@ -3674,6 +3691,8 @@ module.exports = {
   createProductionSubfolders,
   createPostProductionSubfoldersOnly,
   ensurePostProductionFolder,
+  ensureEditsSubfolder,
+  ensureEditedDeliverablesFolder,
   downloadFiles,
   uploadFile,
   deleteFile,

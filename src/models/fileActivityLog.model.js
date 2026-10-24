@@ -15,7 +15,7 @@ const fileActivityLogSchema = new mongoose.Schema(
     },
     action: {
       type: String,
-      enum: ["upload", "delete"],
+      enum: ["upload", "delete", "send_for_edits", "client_selection_received", "start_editing", "submit_approval", "request_revision", "revision_downloaded", "revision_uploaded", "submit_revision", "approve", "complete"],
       required: true,
       index: true,
     },

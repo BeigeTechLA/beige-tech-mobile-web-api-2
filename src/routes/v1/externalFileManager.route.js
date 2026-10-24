@@ -1,5 +1,6 @@
 const express = require("express");
 const externalFileManagerController = require("../../controllers/externalFileManager.controller");
+const fileManagerWorkflowRoute = require("./fileManagerWorkflow.route");
 
 const router = express.Router();
 
@@ -18,6 +19,7 @@ const requireInternalKey = (req, res, next) => {
 };
 
 router.use(requireInternalKey);
+router.use(fileManagerWorkflowRoute);
 
 router.get("/workspaces", externalFileManagerController.listWorkspaces);
 router.post("/workspace", externalFileManagerController.createWorkspace);

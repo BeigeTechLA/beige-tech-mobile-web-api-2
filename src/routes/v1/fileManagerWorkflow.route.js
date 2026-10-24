@@ -1,0 +1,16 @@
+const express = require("express");
+const controller = require("../../controllers/fileManagerWorkflow.controller");
+const router = express.Router();
+router.get("/workflows", controller.listWorkflows);
+router.get("/workflows-storage-usage", controller.storageUsage);
+router.get("/workflows/:orderId", controller.getWorkflow);
+router.put("/workflows/:orderId/requirements", controller.updateRequirements);
+router.post("/workflows/:orderId/start-editing", controller.startEditing);
+router.get("/workflows/:orderId/progress", controller.getProgress);
+router.post("/workflows/:orderId/submit-approval", controller.submitApproval);
+router.post("/workflows/:orderId/submit-revision", controller.submitRevision);
+router.post("/workflows/:orderId/complete", controller.complete);
+router.get("/workflows/:orderId/timeline", controller.timeline);
+router.get("/workflows/:orderId/next-action", controller.nextAction);
+router.get("/workflows/:orderId/before-after", controller.beforeAfter);
+module.exports = router;
