@@ -116,7 +116,10 @@ const downloadFolder = catchAsync(async (req, res, next) => {
 
     // Create a ZIP archive
     const archive = archiver("zip", {
-      zlib: { level: 9 }, // Set compression level
+      // Most file-manager assets are already compressed media. Storing them
+      // avoids spending CPU recompressing them and lets the ZIP stream start faster.
+      store: true,
+      zlib: { level: 0 },
     });
 
     // Set up error handling
@@ -194,22 +197,36 @@ const downloadSelectedFiles = catchAsync(async (req, res, next) => {
     const files = [];
     let totalSize = 0;
 
-    for (const filepath of filepaths) {
-      const file = gcpFileService.bucket.file(filepath);
-      const [exists] = await file.exists();
-      if (!exists) {
-        return res.status(404).json({ success: false, message: `File not found: ${filepath}` });
-      }
+    // One metadata request per file, with bounded concurrency, avoids the old
+    // sequential exists + metadata round trips for every selected file.
+    const metadataBatchSize = 24;
+    for (let index = 0; index < filepaths.length; index += metadataBatchSize) {
+      const batch = filepaths.slice(index, index + metadataBatchSize);
+      const rows = await Promise.all(batch.map(async (filepath) => {
+        const file = gcpFileService.bucket.file(filepath);
+        try {
+          const [metadata] = await file.getMetadata();
+          return { file, filepath, size: parseInt(metadata?.size || 0, 10) };
+        } catch (error) {
+          if (Number(error?.code) === 404) return { missing: filepath };
+          throw error;
+        }
+      }));
 
-      const [metadata] = await file.getMetadata();
-      totalSize += parseInt(metadata?.size || 0, 10);
-      if (totalSize > SELECTED_ZIP_MAX_BYTES) {
-        return res.status(413).json({
-          success: false,
-          message: "Selected files are too large to download together. Please download fewer files.",
-        });
+      const missing = rows.find((row) => row.missing);
+      if (missing) {
+        return res.status(404).json({ success: false, message: `File not found: ${missing.missing}` });
       }
-      files.push(file);
+      for (const row of rows) {
+        totalSize += row.size;
+        if (totalSize > SELECTED_ZIP_MAX_BYTES) {
+          return res.status(413).json({
+            success: false,
+            message: "Selected files are too large to download together. Please download fewer files.",
+          });
+        }
+        files.push(row.file);
+      }
     }
 
     const archiveName = String(req.body.filename || "selected-files")
