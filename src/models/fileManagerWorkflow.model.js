@@ -54,10 +54,7 @@ const fileManagerWorkflowSchema = new mongoose.Schema({
   completedAt: { type: Date, default: null },
 }, { timestamps: true });
 
-fileManagerWorkflowSchema.index({ status: 1 });
-fileManagerWorkflowSchema.index({ dueDate: 1 });
 fileManagerWorkflowSchema.index({ updatedAt: -1 });
-fileManagerWorkflowSchema.index({ editorId: 1 });
 fileManagerWorkflowSchema.plugin(toJSON);
 
 module.exports = mongoose.model("FileManagerWorkflow", fileManagerWorkflowSchema);

@@ -560,6 +560,29 @@ const handleWorkflowUpload = async ({ orderId, path, userId, authorName }) => ru
   if (!version && workflow.status === "not_started") await fileManagerWorkflowService.transition(orderId, "in_progress", { by: userId, byName: authorName, note: "Editing Started Automatically" });
 });
 
+const handleRevisionDownload = async ({ paths, actor }) => runWorkflowHook("revision-download", async () => {
+  const normalizedPaths = [...new Set((paths || []).map(normalizeWorkspacePath).filter(Boolean))];
+  if (!normalizedPaths.length) return;
+  const downloadedFiles = await FileMeta.find({
+    isFolder: false,
+    $or: normalizedPaths.map((path) => ({ path: { $regex: `^${escapeRegex(path.replace(/\/$/, ""))}(?:/|$)` } })),
+  }).select("path metadata.orderId").lean();
+  const revisions = downloadedFiles.reduce((groups, file) => {
+    const version = Number(file.path.match(/\/Post-Production\/Edits\/Revisions\/Version(\d+)\//i)?.[1] || 0);
+    const orderId = normalizeExternalId(file.metadata?.orderId);
+    if (!version || !orderId) return groups;
+    const key = `${orderId}:${version}`;
+    groups.set(key, { orderId, version, fileCount: (groups.get(key)?.fileCount || 0) + 1 });
+    return groups;
+  }, new Map());
+  await Promise.all(Array.from(revisions.values()).map(({ orderId, version, fileCount }) => fileManagerWorkflowService.recordActivity(orderId, "revision_downloaded", {
+    by: actor.actorUserId,
+    byName: actor.actorName,
+    version,
+    fileCount,
+  })));
+});
+
 const buildActivityDisplayText = (log = {}) => {
   const count = Number(log.fileCount || 0); const version = log.metadata?.version ? ` (version ${log.metadata.version})` : "";
   const labels = { upload: `${count} file${count === 1 ? "" : "s"} uploaded`, delete: `${count} file${count === 1 ? "" : "s"} deleted`, send_for_edits: "Files sent for edits", client_selection_received: "Client selection received", start_editing: "Editing started", submit_approval: "Submitted for approval", request_revision: `Revision requested${version}`, revision_downloaded: `Revision downloaded${version}`, revision_uploaded: `Revision uploaded${version}`, submit_revision: `Revision submitted${version}`, approve: "Approved", complete: "Completed" };
@@ -3369,6 +3392,7 @@ exports.getFileDownloadUrl = async (req, res, next) => {
         : `Website_Shoots_Flow/${filePath}`,
       true
     );
+    await handleRevisionDownload({ paths: [filePath], actor: normalizeActivityActor(req.body) });
 
     return res.status(httpStatus.OK).json({
       success: true,
@@ -3409,6 +3433,8 @@ exports.getFolderDownloadUrl = async (req, res, next) => {
         resolveWorkspaceBasePath(workspace.path, String(folder.phase || "root").trim().toLowerCase(), String(folder.path).trim())
       )))]
       : [normalizeWorkspacePath(resolveWorkspaceBasePath(workspace.path, phase, subPath))];
+
+    await handleRevisionDownload({ paths: cleanPaths, actor: normalizeActivityActor(req.body) });
 
     return res.status(httpStatus.OK).json({
       success: true,

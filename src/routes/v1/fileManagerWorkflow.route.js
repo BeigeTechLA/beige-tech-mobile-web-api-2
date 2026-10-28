@@ -3,6 +3,7 @@ const controller = require("../../controllers/fileManagerWorkflow.controller");
 const router = express.Router();
 router.get("/workflows", controller.listWorkflows);
 router.get("/workflows-storage-usage", controller.storageUsage);
+router.get("/workflows/:orderId/activity", controller.activity);
 router.get("/workflows/:orderId", controller.getWorkflow);
 router.put("/workflows/:orderId/requirements", controller.updateRequirements);
 router.post("/workflows/:orderId/start-editing", controller.startEditing);

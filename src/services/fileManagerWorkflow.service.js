@@ -23,7 +23,7 @@ const getOrCreateWorkflow = async (orderId) => {
 const recordActivity = async (orderId, action, { by, byName, note, fileCount = 0, version, status } = {}) => {
   const root = await rootFor(orderId);
   if (!root) return null;
-  return FileActivityLog.create({ folderPath: `${clean(root.path)}/Post-Production/Edits/`, rootPath: `${clean(root.path)}/`, action, actorUserId: by || null, actorName: byName ?? null, fileCount, metadata: { note: note || "", version: version ?? null, status: status || null, orderId: clean(orderId) } });
+  return FileActivityLog.create({ folderPath: `${clean(root.path)}/Post-Production/Edits/`, rootPath: `${clean(root.path)}/`, action, actorUserId: by || null, actorName: byName ?? null, fileCount, metadata: { note: note || "", version: version ?? null, fileCount, status: status || null, orderId: clean(orderId) } });
 };
 
 const transition = async (orderId, toStatus, { by, byName, note } = {}) => {
