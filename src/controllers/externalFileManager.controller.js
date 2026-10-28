@@ -2839,6 +2839,144 @@ exports.copyFiles = async (req, res, next) => {
   }
 };
 
+exports.moveEntries = async (req, res, next) => {
+  try {
+    const externalId = normalizeExternalId(req.body.externalId);
+    const phase = String(req.body.phase || "").trim().toLowerCase();
+    const targetPath = String(req.body.targetPath || "").trim().replace(/^\/+|\/+$/g, "");
+    const cursor = normalizeWorkspacePath(req.body.cursor || "");
+    const sourcePaths = Array.isArray(req.body.sourcePaths) ? req.body.sourcePaths : [];
+    if (!externalId || !["pre", "post"].includes(phase) || !sourcePaths.length || sourcePaths.length > 250 ||
+      [targetPath, ...sourcePaths].some((value) => typeof value !== "string" || value.split("/").some((part) => part === "." || part === ".."))) {
+      return res.status(httpStatus.BAD_REQUEST).json({ success: false, message: "Invalid move request" });
+    }
+    const workspace = await findWorkspaceRoot(externalId);
+    if (!workspace) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Workspace not found" });
+    const root = normalizeWorkspacePath(workspace.path).replace(/\/+$/, "");
+    const destinationFolder = normalizeWorkspacePath(resolveWorkspaceBasePath(workspace.path, phase, targetPath)).replace(/\/+$/, "");
+    if (!destinationFolder.startsWith(`${root}/`)) {
+      return res.status(httpStatus.BAD_REQUEST).json({ success: false, message: "Destination is outside this workspace" });
+    }
+    const destinationDoc = await FileMeta.findOne({ path: { $in: [destinationFolder, `${destinationFolder}/`] }, isFolder: true });
+    if (!destinationDoc) return res.status(httpStatus.NOT_FOUND).json({ success: false, message: "Destination folder not found" });
+
+    const expandedPaths = [];
+    let movingSystemFolderFiles = false;
+    for (const rawPath of sourcePaths) {
+      const requestedPath = normalizeWorkspacePath(rawPath).replace(/\/+$/, "");
+      const systemFolder = await FileMeta.findOne({ path: { $in: [requestedPath, `${requestedPath}/`] }, isFolder: true });
+      const isWorkflowFolderPath = new RegExp(`^${escapeRegex(root)}/(?:Pre-Production|Post-Production/(?:Raw Footage|Edits|Edited Footage|Final Deliverables))$`, "i").test(requestedPath);
+      if (systemFolder && (isWorkflowFolderPath || [
+        "preproduction",
+        "postproduction_raw_footage",
+        "postproduction_edited_footage",
+        "postproduction_final_deliverables",
+      ].includes(systemFolder.folderType))) {
+        movingSystemFolderFiles = true;
+        const directEntries = await listWorkspaceContents(`${requestedPath}/`);
+        expandedPaths.push(...directEntries.files.map((entry) => entry.path));
+      } else {
+        expandedPaths.push(rawPath);
+      }
+    }
+    const remainingPaths = movingSystemFolderFiles
+      ? [...new Set(expandedPaths)].sort().filter((entry) => entry > cursor)
+      : expandedPaths;
+    const hasMore = movingSystemFolderFiles && remainingPaths.length > 50;
+    const batchPaths = movingSystemFolderFiles ? remainingPaths.slice(0, 50) : remainingPaths;
+    const results = [];
+    for (const rawPath of new Set(batchPaths)) {
+      const sourcePath = normalizeWorkspacePath(rawPath).replace(/\/+$/, "");
+      const movedStorage = [];
+      const updatedMetadata = [];
+      try {
+        if (!sourcePath.startsWith(`${root}/`) || sourcePath === destinationFolder ||
+          destinationFolder.startsWith(`${sourcePath}/`)) {
+          throw Object.assign(new Error("Source or destination is invalid"), { status: 400 });
+        }
+        if ([`${root}/Pre-Production`, `${root}/Post-Production`].includes(sourcePath)) {
+          throw Object.assign(new Error("Production phase folders cannot be moved"), { status: 400 });
+        }
+        const wantsFolder = String(rawPath).endsWith("/");
+        const sourceDoc = wantsFolder
+          ? await FileMeta.findOne({ path: { $in: [`${sourcePath}/`, sourcePath] }, isFolder: true })
+          : await FileMeta.findOne({ path: sourcePath, isFolder: false });
+        if (!sourceDoc) throw Object.assign(new Error("Source entry not found"), { status: 404 });
+        if (sourceDoc.folderType && ["root", "preproduction", "postproduction", "postproduction_raw_footage", "postproduction_edited_footage", "postproduction_final_deliverables"].includes(sourceDoc.folderType)) {
+          throw Object.assign(new Error("System folders cannot be moved; select their files instead"), { status: 400 });
+        }
+        const destinationRoot = `${destinationFolder}/${sourceDoc.name || sourcePath.split("/").pop()}`;
+        if (destinationRoot === sourcePath) throw Object.assign(new Error("Entry is already in that folder"), { status: 400 });
+        const descendants = sourceDoc.isFolder
+          ? await FileMeta.find({ path: { $regex: `^${escapeRegex(sourcePath)}/` } }).sort({ path: 1 })
+          : [];
+        const entries = [sourceDoc, ...descendants];
+        const mappings = entries.map((entry) => ({
+          entry,
+          oldPath: entry.path,
+          newPath: `${destinationRoot}${entry.path.slice(sourcePath.length)}`,
+        }));
+        const destinationPaths = mappings.map((entry) => entry.newPath);
+        if (await FileMeta.exists({ path: { $in: [...destinationPaths, destinationRoot, `${destinationRoot}/`] } })) {
+          throw Object.assign(new Error("A file or folder with that name already exists at the destination"), { status: 409 });
+        }
+        // Copy every cloud object before changing metadata. No source is removed if a destination collides.
+        const fileMappings = mappings.filter(({ entry }) => !entry.isFolder);
+        const storageErrors = [];
+        await runWithConcurrency(fileMappings, 8, async ({ oldPath, newPath }) => {
+          try {
+            const [exists] = await gcpFileService.bucket.file(`Website_Shoots_Flow/${newPath}`).exists();
+            if (exists) throw Object.assign(new Error("A destination file already exists in storage"), { status: 409 });
+            const [sourceExists] = await gcpFileService.bucket.file(`Website_Shoots_Flow/${oldPath}`).exists();
+            if (!sourceExists) throw Object.assign(new Error("A source file is missing from storage"), { status: 404 });
+          } catch (error) { storageErrors.push(error); }
+        });
+        if (storageErrors.length) throw storageErrors[0];
+        await runWithConcurrency(fileMappings, 8, async ({ oldPath, newPath }) => {
+          try {
+            await gcpFileService.moveFile(`Website_Shoots_Flow/${oldPath}`, `Website_Shoots_Flow/${newPath}`);
+            movedStorage.push({ oldPath, newPath });
+          } catch (error) { storageErrors.push(error); }
+        });
+        if (storageErrors.length) throw storageErrors[0];
+        const movedAt = new Date();
+        for (const { entry, newPath } of mappings) {
+          const update = { path: newPath, fullPath: `Website_Shoots_Flow/${newPath}`, updatedAt: movedAt };
+          if (entry._id.equals(sourceDoc._id)) update.parentFolderId = destinationDoc._id;
+          await FileMeta.updateOne({ _id: entry._id }, { $set: update });
+          updatedMetadata.push({ entry, oldPath: entry.path, isRoot: entry._id.equals(sourceDoc._id) });
+        }
+        await touchFolderHierarchy(sourcePath, movedAt);
+        await touchFolderHierarchy(destinationRoot, movedAt);
+        await createFileActivityLog({
+          folderPath: `${destinationFolder}/`, action: "move", actor: normalizeActivityActor(req.body),
+          files: entries, targetPath: destinationRoot,
+          targetName: sourceDoc.name, targetIsFolder: Boolean(sourceDoc.isFolder),
+          metadata: { sourcePath, destinationPath: destinationRoot },
+        }).catch((error) => console.error("Move activity log failed:", error));
+        results.push({ sourcePath, destinationPath: destinationRoot, success: true, fileCount: fileMappings.length });
+      } catch (error) {
+        for (const { entry, oldPath, isRoot } of updatedMetadata.reverse()) {
+          await FileMeta.updateOne({ _id: entry._id }, { $set: {
+            path: oldPath, fullPath: `Website_Shoots_Flow/${oldPath}`,
+            ...(isRoot ? { parentFolderId: entry.parentFolderId } : {}),
+          } }).catch(() => null);
+        }
+        for (const { oldPath, newPath } of movedStorage.reverse()) {
+          await gcpFileService.moveFile(`Website_Shoots_Flow/${newPath}`, `Website_Shoots_Flow/${oldPath}`).catch(() => null);
+        }
+        results.push({ sourcePath, success: false, error: error.message, code: error.status || error.statusCode || 500 });
+      }
+    }
+    return res.status(httpStatus.OK).json({ success: true, data: {
+      total: results.length, successCount: results.filter((item) => item.success).length,
+      failureCount: results.filter((item) => !item.success).length, hasMore,
+      nextCursor: movingSystemFolderFiles ? batchPaths[batchPaths.length - 1] || null : null,
+      items: results,
+    } });
+  } catch (error) { return next(error); }
+};
+
 const parseRevisionVersionNumber = (filePath) => {
   const normalized = String(filePath || "").replace(/\\/g, "/");
   const match = normalized.match(/\/Revisions\/Version(\d+)\//i);

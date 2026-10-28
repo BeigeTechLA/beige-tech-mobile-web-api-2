@@ -1379,6 +1379,22 @@ const copyFile = async (sourcePath, destinationPath) => {
   }
 };
 
+const moveFile = async (sourcePath, destinationPath) => {
+  checkGcpEnabled();
+  const source = bucket.file(String(sourcePath || "").replace(/^\/+/, ""));
+  const destination = bucket.file(String(destinationPath || "").replace(/^\/+/, ""));
+  const [sourceExists] = await source.exists();
+  if (!sourceExists) throw new ApiError(httpStatus.NOT_FOUND, "Source file not found in storage");
+  // The destination must stay empty even if another upload races with the metadata check.
+  await source.copy(destination, { preconditionOpts: { ifGenerationMatch: 0 } });
+  try {
+    await source.delete();
+  } catch (error) {
+    await destination.delete().catch(() => null);
+    throw error;
+  }
+};
+
 const updateGcpFolderMetadata = async (folderName, AddedUserId, orderId) => {
   console.log('🔄 ========== updateGcpFolderMetadata CALLED ==========');
   console.log('📋 Input parameters:', {
@@ -3697,6 +3713,7 @@ module.exports = {
   uploadFile,
   deleteFile,
   copyFile,
+  moveFile,
   getFiles,
   getChatFiles,
   bucket,
